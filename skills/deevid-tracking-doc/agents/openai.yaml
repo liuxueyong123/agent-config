@@ -1,0 +1,4 @@
+interface:
+  display_name: "Deevid 埋点文档"
+  short_description: "按用户指定范围编写埋点草案、解释事件参数，并在开发后核对实现差异"
+  default_prompt: "使用 $deevid-tracking-doc，为我指定的埋点整理完整草案，待我确认后定稿；开发后保留约定并核对实现差异。"
