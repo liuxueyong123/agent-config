@@ -5,12 +5,14 @@
 ## 当前内容
 
 - `AGENTS.md`：共享全局规则，分别通过 `~/.codex/AGENTS.md` 和 `~/.claude/CLAUDE.md` 加载。
+- `skills/code-review-and-quality/`：代码质量审查 skill，包含安全与性能检查清单。
+- `skills/code-simplification/`：保持行为不变的代码简化 skill。
 - `skills/deevid-tracking-doc/`：Deevid 埋点文档 skill，包含模板与界面元数据。
 - `skills/implementation-handoff/`：实现交接 skill。
 - `install.sh`：为选定客户端建立全局规则及 `skills/` 下所有 skill 的软链接。
 - `tests/test_install.py`：在隔离目录验证安装、重复运行和冲突保护。
 
-两个 skill 共用现有正文，全局规则中的 skill 路径按当前客户端发现的实际位置解析。其他个人 skill、系统 skill 和插件不由此仓库管理。
+以上四个 skill 在两个客户端共用同一份正文与配套资源，全局规则中的 skill 路径按当前客户端发现的实际位置解析。其他个人 skill、系统 skill 和插件不由此仓库管理。
 
 ## 在其他电脑安装
 
@@ -43,7 +45,7 @@ bash install.sh --skills-dir "$HOME/.agents/skills"
 
 同一客户端内，每个 skill 只选择一个加载入口，避免重复显示。需要自定义配置目录时可传入 `--codex-dir /绝对路径` 或 `--claude-dir /绝对路径`。
 
-在 Claude Code 中可使用 `/deevid-tracking-doc` 和 `/implementation-handoff` 调用，也可根据任务自动选用。`agents/openai.yaml` 是 Codex 的界面元数据，Claude Code 共用的是 `SKILL.md` 及其配套资源，无需复制或转换正文。
+在 Claude Code 中可使用 `/code-review-and-quality`、`/code-simplification`、`/deevid-tracking-doc` 和 `/implementation-handoff` 调用，也可根据任务自动选用。`agents/openai.yaml` 是 Codex 的界面元数据，Claude Code 共用的是 `SKILL.md` 及其配套资源，无需复制或转换正文。
 
 安装可重复运行，已经正确连接的目标会跳过。已有普通文件、目录、指向其他位置的链接或失效链接都会被视为冲突；脚本在创建链接前检查全部目标，遇到冲突会停止，请先检查并将冲突项备份到加载目录之外。运行中的磁盘或权限错误仍可能造成部分安装，排除原因后可以重跑。脚本适用于 macOS 和 Linux 的 Bash 环境，原生 Windows 未验证。
 
@@ -78,6 +80,8 @@ Claude Code 支持软链接 skill 文件夹和共享规则文件，参见[官方
 首次迁移时，原来的全局规则和两个 skill 已备份到 `~/.codex/backups/agent-config-20261016-*`，备份不进入 Git 仓库。
 
 接入 Claude Code 时，原 `~/.claude/CLAUDE.md` 链接已另行备份到 `~/.claude/backups/agent-config-*`，新入口直接链接到本仓库，不再经过 Codex 目录。
+
+2026-10-22 迁入 `code-review-and-quality` 和 `code-simplification` 时，两个客户端的原目录分别备份到 `~/.codex/backups/agent-config-20261022-214639/` 和 `~/.claude/backups/agent-config-20261022-214639/`。两边正文一致，共享源完整保留 Claude Code 版本中的来源注释与附带检查清单。
 
 恢复时，先核对并保存迁移后在仓库中产生的修改，再逐项确认全局路径确实为指向此仓库的软链接；删除链接本身后，从对应备份目录移回原文件或文件夹。不要递归删除软链接目标。
 
