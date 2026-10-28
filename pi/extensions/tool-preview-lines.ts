@@ -1,11 +1,16 @@
 /**
- * 工具输出预览行数
+ * 工具调用紧凑显示
  *
  * Pi 未展开工具结果时只显示固定行数，这些行数硬编码在渲染器里，没有对应设置项，
  * 而且每次升级 pi 都会重装 node_modules。本扩展在运行时接管 bash / grep / ls / find /
- * write / edit 的结果渲染，把预览行数改成可配置值，升级后依然生效。
+ * write / edit 的渲染：
  *
- * 配置（可选，未配置的项使用 DEFAULTS，当前均为 0，即折叠时不显示结果内容）。
+ * - 折叠时结果区不占行，调用行、结果摘要、耗时合并成一行，仍使用 pi 默认的卡片 shell。
+ * - 运行时把折叠工具的卡片纵向内边距压到 0，并去掉块前空行，让相邻调用连成一片。
+ * - 连续的工具调用会收进一个折叠组，默认只显示一行摘要，点开后是各个工具的卡片。
+ * - 只有展开（app.tools.expand）时才输出完整命令、输出或 diff。
+ *
+ * 配置（可选，未配置的项使用 DEFAULTS，当前均为 0，即折叠时不预览结果内容）。
  * 示例：~/.pi/agent/tool-preview-lines.json
  * {
  *   "bash": 2,
@@ -17,9 +22,9 @@
  *   "commandChars": 80
  * }
  *
+ * 配置值大于 0 时，折叠状态下会在调用行下面额外输出这么多行预览。
  * 修改配置后需要重启会话或执行 /reload。
  * read 未展开时本来就不显示内容（只显示调用行），因此不在这里覆盖。
- * edit 内置行为是不管折叠与否都展示完整 diff，这里统一改成折叠时只显示前几行或行数提示。
  */
 
 import { existsSync, readFileSync } from "node:fs";
@@ -28,23 +33,24 @@ import { join, sep } from "node:path";
 import type { ExtensionAPI, ToolRenderers } from "@earendil-works/pi-coding-agent";
 import {
 	DEFAULT_MAX_BYTES,
+	ToolExecutionComponent,
 	formatSize,
 	getLanguageFromPath,
 	highlightCode,
 	keyHint,
 	renderDiff,
-	truncateToVisualLines,
 } from "@earendil-works/pi-coding-agent";
 import {
 	Container,
-	Spacer,
-	Text,
 	stripTerminalSequences,
 	visibleWidth,
+	wrapTextWithAnsi,
 	type Component,
+	type TuiMouseEvent,
+	type TuiMouseEventResult,
 } from "@earendil-works/pi-tui";
 
-/** 支持覆盖的工具及其默认预览行数，0 表示不显示结果内容 */
+/** 支持覆盖的工具及其默认预览行数，0 表示折叠时不预览结果内容 */
 const DEFAULTS = {
 	bash: 0,
 	grep: 0,
@@ -56,6 +62,301 @@ const DEFAULTS = {
 
 /** bash 调用行里命令的默认最大字符数，超出用省略号截断 */
 const DEFAULT_COMMAND_CHARS = 80;
+
+/** 单行内摘要与耗时的分隔符 */
+const SEPARATOR = " · ";
+
+/** 折叠摘要里错误信息的最大字符数 */
+const ERROR_SUMMARY_CHARS = 60;
+
+/**
+ * 折叠状态下把工具卡片压成一行：
+ * - children 第一项是 pi 加的 Spacer(1)，负责块与块之间的空行；折叠时把它压成 0 行。
+ * - 卡片外壳是 Box(1, 1)，折叠时把纵向内边距设为 0，展开时还原成 1，交互逻辑保持 pi 原本的实现。
+ * 对所有工具生效，包括未接管渲染的 read，折叠组展开后各成员的高度才一致。
+ */
+const COMPACT_ROWS_PATCH = Symbol.for("pi.compact-tool-rows");
+
+/** 组内成员标记，决定块前空行是否保留 */
+const GROUP_MEMBER = Symbol.for("pi.tool-group-member");
+
+interface PatchableSpacer {
+	setLines?: (lines: number) => void;
+}
+
+interface PatchableExecution {
+	expanded?: boolean;
+	contentBox?: { paddingY?: number; invalidateCache?: () => void };
+	children?: PatchableSpacer[];
+	updateDisplay: () => void;
+	[COMPACT_ROWS_PATCH]?: boolean;
+	[GROUP_MEMBER]?: boolean;
+}
+
+/** 标记组件已被收进折叠组，组内成员之间不留空行 */
+function markGrouped(component: ToolExecutionComponent): void {
+	const execution = component as unknown as PatchableExecution;
+	execution[GROUP_MEMBER] = true;
+	// children[0] 是 pi 加的 Spacer(1)，入组后立即压掉
+	execution.children?.[0]?.setLines?.(0);
+}
+
+function enableCompactRows(): void {
+	try {
+		const prototype = ToolExecutionComponent.prototype as unknown as PatchableExecution;
+		if (prototype[COMPACT_ROWS_PATCH] === true) {
+			return;
+		}
+
+		const originalUpdateDisplay = prototype.updateDisplay;
+		prototype.updateDisplay = function (this: PatchableExecution): void {
+			const expanded = this.expanded === true;
+
+			// 展开时保留卡片内边距，折叠时压到 0，让整块只剩调用行
+			const box = this.contentBox;
+			if (box !== undefined) {
+				const desired = expanded ? 1 : 0;
+				if (box.paddingY !== desired) {
+					box.paddingY = desired;
+					box.invalidateCache?.();
+				}
+			}
+
+			// children[0] 是 pi 固定加在块前的 Spacer(1)。
+			// 不能只在渲染结果里删掉那行空行：鼠标坐标按 children 高度换算，布局和坐标必须一起变。
+			// 组内成员之间不留空行；独立工具保留一行，和 thinking 折叠块的间距一致。
+			const spacer = this.children?.[0];
+			if (spacer !== undefined && typeof spacer.setLines === "function") {
+				spacer.setLines(expanded || this[GROUP_MEMBER] !== true ? 1 : 0);
+			}
+
+			originalUpdateDisplay.call(this);
+		};
+
+		prototype[COMPACT_ROWS_PATCH] = true;
+	} catch {
+		// 升级 pi 后内部结构变化时跳过，扩展其余部分仍然生效
+	}
+}
+
+/** 折叠组只依赖工具组件的这几个成员，不绑定具体类 */
+interface GroupMember extends Component {
+	isPartial?: boolean;
+	expanded?: boolean;
+	result?: { isError?: boolean };
+	setExpanded?: (expanded: boolean) => void;
+	ui?: { requestRender?: () => void };
+}
+
+/** pi 把主题存在 globalThis 上，用于跨模块加载器共享；这里只读 */
+const THEME_KEYS = [
+	Symbol.for("@earendil-works/pi-coding-agent:theme"),
+	Symbol.for("@mariozechner/pi-coding-agent:theme"),
+] as const;
+
+function globalTheme(): ThemeLike | undefined {
+	const store = globalThis as unknown as Record<symbol, ThemeLike | undefined>;
+	for (const key of THEME_KEYS) {
+		const candidate = store[key];
+		if (candidate !== undefined && typeof candidate.fg === "function") {
+			return candidate;
+		}
+	}
+	return undefined;
+}
+
+/**
+ * 连续工具调用的折叠组。
+ * 折叠时输出一行摘要，展开时先输出同一行（可点回折叠），再按顺序渲染成员。
+ * 鼠标坐标按标题行偏移后转发，所以组内单个工具仍用 pi 原生的点击展开看详情。
+ */
+class ToolGroup implements Component {
+	private readonly members: GroupMember[] = [];
+	private collapsed = true;
+
+	add(member: GroupMember): void {
+		this.members.push(member);
+	}
+
+	invalidate(): void {
+		for (const member of this.members) {
+			member.invalidate?.();
+		}
+	}
+
+	render(width: number): string[] {
+		// 与 thinking 折叠块保持一致：组前面留一行空行，组内成员之间不留
+		const lines = ["", this.headerLine(width)];
+		if (this.collapsed) {
+			return lines;
+		}
+		for (const member of this.members) {
+			lines.push(...member.render(width));
+		}
+		return lines;
+	}
+
+	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		// 第 0 行是空行，第 1 行是摘要，两者都可以切换折叠
+		if (event.type === "click" && event.button === "left" && event.y <= 1) {
+			this.collapsed = !this.collapsed;
+			this.requestRender();
+			return { handled: true };
+		}
+		if (this.collapsed || event.y < 2) {
+			return undefined;
+		}
+		const localY = event.y - 2;
+		let offset = 0;
+		for (const member of this.members) {
+			const height = member.render(event.width).length;
+			if (localY >= offset && localY < offset + height) {
+				const forwarded = { ...event, y: localY - offset, height };
+				const handled = member.handleMouse?.(forwarded);
+				if (handled !== undefined) {
+					return handled;
+				}
+				// 只处理左键点击。鼠标移动、滚轮等事件必须原样放弃，否则 hover 也会切换展开状态。
+				if (event.type !== "click" || event.button !== "left") {
+					return undefined;
+				}
+				// 成员首行是 Spacer，展开后还有一行内边距，两者都包不到 MouseRegion。
+				// 点在这些空白上时直接切换成员自己的展开状态，整张卡片才能点击收起。
+				if (typeof member.setExpanded === "function") {
+					member.setExpanded(member.expanded !== true);
+					member.ui?.requestRender?.();
+					return { handled: true };
+				}
+				return undefined;
+			}
+			offset += height;
+		}
+		return undefined;
+	}
+
+	private requestRender(): void {
+		for (const member of this.members) {
+			if (member.ui?.requestRender !== undefined) {
+				member.ui.requestRender();
+				return;
+			}
+		}
+	}
+
+	private headerLine(width: number): string {
+		const theme = globalTheme();
+		const count = this.members.length;
+		const failed = this.members.filter((member) => member.result?.isError === true).length;
+		const running = this.members.some((member) => member.isPartial === true);
+		const details = [`${count} tool ${count === 1 ? "call" : "calls"}`];
+		if (failed > 0) {
+			details.push(`${failed} failed`);
+		}
+		if (running) {
+			details.push("running");
+		}
+		// 先按纯文本截断，再着色，避免截断 ANSI 序列
+		const body = clipPlainText(`⚙ ${details.join(" · ")}`, Math.max(1, width - 2));
+		const suffix = ` (${this.collapsed ? "click to expand" : "click to collapse"})`;
+		const tail = visibleWidth(body) + visibleWidth(suffix) <= width ? suffix : "";
+		if (theme === undefined) {
+			return ` ${body}${tail}`;
+		}
+		const tone = failed > 0 ? "error" : "toolTitle";
+		return ` ${theme.bold(theme.fg(tone, body))}${theme.fg("muted", tail)}`;
+	}
+}
+
+/**
+ * 只含 toolCall、没有可见文本的 assistant 组件渲染为空行数，但会占据 children 的位置。
+ * 不清掉它，一轮一个的 assistant 组件会把连续的工具调用全部断开。
+ */
+function isInvisibleAssistant(component: unknown): boolean {
+	if (component === null || typeof component !== "object") {
+		return false;
+	}
+	const candidate = component as {
+		constructor?: { name?: string };
+		lastMessage?: { content?: unknown };
+	};
+	if (candidate.constructor?.name !== "AssistantMessageComponent") {
+		return false;
+	}
+	const content = candidate.lastMessage?.content;
+	// 内容为空说明消息刚开始流式，可能还会出现文本，不能当作不可见
+	if (!Array.isArray(content) || content.length === 0) {
+		return false;
+	}
+	return !content.some((block) => {
+		if (block === null || typeof block !== "object") {
+			return false;
+		}
+		const item = block as { type?: string; text?: string; thinking?: string };
+		if (item.type === "text") {
+			return (item.text ?? "").trim() !== "";
+		}
+		if (item.type === "thinking") {
+			return (item.thinking ?? "").trim() !== "";
+		}
+		return false;
+	});
+}
+
+/**
+ * pi 把每个工具组件直接 addChild 到 transcript 容器，扩展只能拿到单个组件。
+ * 这里在容器层把连续的工具组件收进 ToolGroup：
+ * - 单个工具也建组，折叠后与多个工具的外观一致。
+ * - 中间插入文本、状态行等普通组件会自然断开，下一批工具另开一组。
+ * - 只含 toolCall 的 assistant 组件会被先清掉，它们本来就不渲染任何行。
+ */
+const TOOL_GROUPS_PATCH = Symbol.for("pi.tool-groups");
+
+interface PatchableContainer {
+	children: unknown[];
+	addChild: (component: unknown) => void;
+	[TOOL_GROUPS_PATCH]?: boolean;
+}
+
+function enableToolGroups(): void {
+	try {
+		const prototype = Container.prototype as unknown as PatchableContainer;
+		if (prototype[TOOL_GROUPS_PATCH] === true) {
+			return;
+		}
+
+		const originalAddChild = prototype.addChild;
+		prototype.addChild = function (this: PatchableContainer, component: unknown): void {
+			if (component instanceof ToolExecutionComponent) {
+				// 先清掉末尾不可见的 assistant 组件，连续工具才能归到同一组
+				while (this.children.length > 0 && isInvisibleAssistant(this.children[this.children.length - 1])) {
+					this.children.pop();
+				}
+				const last = this.children[this.children.length - 1];
+				if (last instanceof ToolGroup) {
+					markGrouped(component);
+					last.add(component as unknown as GroupMember);
+					return;
+				}
+				// 单个工具也建组，折叠后的外观与多个工具一致
+				const group = new ToolGroup();
+				if (last instanceof ToolExecutionComponent) {
+					this.children.pop();
+					markGrouped(last);
+					group.add(last as unknown as GroupMember);
+				}
+				markGrouped(component);
+				group.add(component as unknown as GroupMember);
+				this.children.push(group);
+				return;
+			}
+			originalAddChild.call(this, component);
+		};
+
+		prototype[TOOL_GROUPS_PATCH] = true;
+	} catch {
+		// 升级 pi 后内部结构变化时跳过，工具退回逐个显示
+	}
+}
 
 type ToolName = keyof typeof DEFAULTS;
 
@@ -89,6 +390,7 @@ interface RenderContextLike {
 	lastComponent?: Component;
 	cwd?: string;
 	isError?: boolean;
+	isPartial?: boolean;
 	executionStarted?: boolean;
 	durationMs?: number;
 	expanded?: boolean;
@@ -110,6 +412,12 @@ interface ThemeLike {
 interface PreviewConfig {
 	lines: Record<ToolName, number>;
 	commandChars: number;
+}
+
+/** 挂在 context.state 上的折叠摘要 */
+interface RowSummary {
+	text: string;
+	tone: "muted" | "warning" | "error";
 }
 
 /** 一次读取并解析配置，避免启动时重复读同一文件 */
@@ -222,63 +530,6 @@ function shortenPath(path: string): string {
 	return path.startsWith(home + sep) ? `~${path.slice(home.length)}` : path;
 }
 
-function pathDisplay(rawPath: string, theme: ThemeLike): string {
-	if (!rawPath) {
-		return theme.fg("toolOutput", "...");
-	}
-	return theme.fg("accent", sanitizeDisplayText(shortenPath(rawPath)));
-}
-
-/** 复用上一次的 Text 组件，避免每帧新建组件 */
-function setResultText(context: RenderContextLike, text: string): Text {
-	const component =
-		context.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
-	component.setText(text);
-	return component;
-}
-
-function expandHint(): string {
-	return keyHint("app.tools.expand", "to expand");
-}
-
-/**
- * 按「逻辑行」截断的通用结果渲染。
- * keep = "end" 时保留尾部（适合日志），"start" 时保留头部（适合列表）。
- */
-function renderLineList(
-	result: ToolResultLike,
-	options: RenderOptionsLike,
-	theme: ThemeLike,
-	context: RenderContextLike,
-	maxLines: number,
-	keep: "start" | "end",
-	warnings: string[] = [],
-): Text {
-	const { lines } = readOutput(context, result);
-	const shown = options.expanded
-		? lines
-		: maxLines === 0
-			? []
-			: keep === "end"
-				? lines.slice(-maxLines)
-				: lines.slice(0, maxLines);
-	const hidden = lines.length - shown.length;
-
-	let text = "";
-	if (shown.length > 0) {
-		text = `\n${shown.map((line) => theme.fg("toolOutput", line)).join("\n")}`;
-	}
-	if (hidden > 0) {
-		const label =
-			shown.length === 0 ? `${hidden} lines` : keep === "end" ? `${hidden} earlier lines` : `${hidden} more lines`;
-		text += `\n${theme.fg("muted", `... (${label},`)} ${expandHint()}${theme.fg("muted", ")")}`;
-	}
-	for (const warning of warnings) {
-		text += `\n${theme.fg("warning", `[${warning}]`)}`;
-	}
-	return setResultText(context, text);
-}
-
 /** 按可见宽度截断纯文本，不插入 ANSI reset，避免破坏外层背景色 */
 function clipPlainText(text: string, maxWidth: number): string {
 	if (maxWidth <= 0) {
@@ -304,10 +555,13 @@ interface LinePart {
 }
 
 /** 单行调用行：按终端宽度截断，避免长命令折行占满多行 */
-class SingleLineText implements Component {
+class ToolRow implements Component {
 	private parts: LinePart[] = [];
+	private readonly theme: ThemeLike;
 
-	constructor(private readonly theme: ThemeLike) {}
+	constructor(theme: ThemeLike) {
+		this.theme = theme;
+	}
 
 	setParts(parts: LinePart[]): void {
 		this.parts = parts;
@@ -344,21 +598,26 @@ class SingleLineText implements Component {
 	}
 }
 
-/** 与内置 bash 渲染一致的视觉行预览：按终端宽度折行后保留尾部 */
-class VisualLinePreview implements Component {
+/** 结果区容器；折叠时保持为空，卡片只剩调用行 */
+function resultContainer(context: RenderContextLike): Container {
+	const container = context.lastComponent instanceof Container ? context.lastComponent : new Container();
+	container.clear();
+	return container;
+}
+
+/**
+ * 多行内容：按终端宽度折行，逐行不补空格。
+ * 不用内置 Text：它在无背景色时也会把每行补齐到整宽，展开的 diff/输出复制出来会带一截行尾空格。
+ */
+class PlainText implements Component {
 	private cachedWidth: number | undefined;
 	private cachedLines: string[] | undefined;
+	private readonly text: string;
 
-	constructor(
-		private readonly options: {
-			text: string;
-			maxVisualLines: number;
-			keep: "start" | "end";
-			formatHint: (hidden: number) => string;
-		},
-	) {}
+	constructor(text: string) {
+		this.text = text;
+	}
 
-	/** 主题变化时清缓存，避免继续输出旧配色 */
 	invalidate(): void {
 		this.cachedWidth = undefined;
 		this.cachedLines = undefined;
@@ -368,17 +627,63 @@ class VisualLinePreview implements Component {
 		if (this.cachedLines !== undefined && this.cachedWidth === width) {
 			return this.cachedLines;
 		}
-		const { text, maxVisualLines, keep, formatHint } = this.options;
-		const preview = truncateToVisualLines(text, maxVisualLines, width, 0, keep);
-		if (preview.skippedCount > 0) {
-			const hint = formatHint(preview.skippedCount);
-			this.cachedLines = keep === "start" ? [...preview.visualLines, hint] : [hint, ...preview.visualLines];
-		} else {
-			this.cachedLines = preview.visualLines;
+		if (!this.text || this.text.trim() === "") {
+			this.cachedWidth = width;
+			this.cachedLines = [];
+			return this.cachedLines;
 		}
+		const available = width;
+		const wrapped = wrapTextWithAnsi(this.text, available);
 		this.cachedWidth = width;
+		this.cachedLines = wrapped;
 		return this.cachedLines;
 	}
+}
+
+/**
+ * 折叠摘要来自 renderResult，但调用行由 renderCall 先渲染，因此摘要变化后需要重排一次。
+ * 渲染期间同步调用 invalidate 会重入 updateDisplay，这里推迟到下一轮事件循环并做幂等。
+ */
+function scheduleRefresh(context: RenderContextLike): void {
+	const state = (context.state ??= {});
+	if (state.refreshScheduled === true) {
+		return;
+	}
+	state.refreshScheduled = true;
+	const handle = setTimeout(() => {
+		state.refreshScheduled = false;
+		try {
+			context.invalidate?.();
+		} catch {
+			// 会话切换或退出后组件已被销毁，忽略即可
+		}
+	}, 0);
+	handle.unref?.();
+}
+
+function publishRowSummary(context: RenderContextLike, summary: RowSummary | undefined): void {
+	const state = (context.state ??= {});
+	const previous = state.rowSummary as RowSummary | undefined;
+	const unchanged =
+		(previous === undefined && summary === undefined) ||
+		(previous !== undefined && summary !== undefined && previous.text === summary.text && previous.tone === summary.tone);
+	if (unchanged) {
+		return;
+	}
+	if (summary === undefined) {
+		delete state.rowSummary;
+	} else {
+		state.rowSummary = summary;
+	}
+	scheduleRefresh(context);
+}
+
+function readRowSummary(context: RenderContextLike): RowSummary | undefined {
+	return (context.state ??= {}).rowSummary as RowSummary | undefined;
+}
+
+function expandHint(): string {
+	return keyHint("app.tools.expand", "to expand");
 }
 
 function startTimer(context: RenderContextLike): void {
@@ -505,7 +810,427 @@ function shellWarnings(details: ShellDetails): string[] {
 	return warnings;
 }
 
+/** 折叠状态下只保留一句摘要；完整警告留给展开态 */
+function compactWarnings(warnings: string[]): string | undefined {
+	if (warnings.length === 0) {
+		return undefined;
+	}
+	if (warnings.some((warning) => warning.startsWith("Truncated"))) {
+		return "truncated";
+	}
+	return clipPlainText(warnings[0], ERROR_SUMMARY_CHARS);
+}
+
+function makeSummary(parts: (string | undefined)[], tone: RowSummary["tone"] = "muted"): RowSummary | undefined {
+	const text = parts.filter((part): part is string => part !== undefined && part !== "").join(SEPARATOR);
+	if (!text) {
+		return undefined;
+	}
+	return { text, tone };
+}
+
+/** 折叠态的错误摘要：取首行有效内容，过长截断 */
+function publishErrorSummary(context: RenderContextLike, lines: string[]): void {
+	const firstLine = lines.find((line) => line.trim() !== "") ?? "error";
+	publishRowSummary(context, { text: clipPlainText(firstLine, ERROR_SUMMARY_CHARS), tone: "error" });
+}
+
+function lineCountSummary(total: number): string {
+	return `${total} ${total === 1 ? "line" : "lines"}`;
+}
+
+/** 组装单行：调用信息 + 折叠摘要 + 耗时，全部塞进一行由 ToolRow 截断 */
+function buildToolRow(
+	theme: ThemeLike,
+	parts: LinePart[],
+	summary: RowSummary | undefined,
+	timer: string | undefined,
+): ToolRow {
+	const all = [...parts];
+	if (summary !== undefined) {
+		all.push({ text: `${SEPARATOR}${summary.text}`, color: summary.tone });
+	}
+	if (timer !== undefined) {
+		all.push({ text: `${SEPARATOR}${timer}`, color: "muted" });
+	}
+	const row = new ToolRow(theme);
+	row.setParts(all);
+	return row;
+}
+
+/** 多行内容组件；缩进由卡片外壳的 paddingX 负责，名字保留历史称呼 */
+function indentedText(text: string): PlainText {
+	return new PlainText(text);
+}
+
+function pathPart(rawPath: string): LinePart {
+	// 路径来自模型和文件系统，属于不可信数据，先去除控制字符再显示
+	const display = rawPath ? shortenPath(sanitizeDisplayText(rawPath)) : "";
+	return {
+		text: ` ${display || "..."}`,
+		color: display ? "accent" : "toolOutput",
+	};
+}
+
+/** 参数统一按 key/value 展开；非对象参数归入 `args` */
+function parseCallEntries(args: unknown): [string, unknown][] {
+	if (args == null) {
+		return [];
+	}
+	return typeof args === "object" && !Array.isArray(args)
+		? Object.entries(args as Record<string, unknown>)
+		: [["args", args]];
+}
+
+/** 折叠态的参数预览：key=value 单行，过长截断 */
+function formatCallPairs(entries: [string, unknown][]): string {
+	const pairs = entries.map(([key, value]) => `${key}=${JSON.stringify(value) ?? String(value)}`).join(" ");
+	return pairs.length > 100 ? `${pairs.slice(0, 97)}...` : pairs;
+}
+
+/** 复刻内置 fallback 的 key=value 折叠格式，保证 grep/ls/find 的调用行与 pi 一致 */
+function callHeaderParts(name: string, args: unknown): LinePart[] {
+	const parts: LinePart[] = [{ text: name, color: "toolTitle", bold: true }];
+	const entries = parseCallEntries(args);
+	if (entries.length > 0) {
+		parts.push({ text: ` ${formatCallPairs(entries)}`, color: "muted" });
+	}
+	return parts;
+}
+
+function expandedCallText(name: string, args: unknown, theme: ThemeLike): string {
+	const header = theme.fg("toolTitle", theme.bold(name));
+	const entries = parseCallEntries(args);
+	if (entries.length === 0) {
+		return header;
+	}
+	const lines = entries.map(([key, value]) => {
+		const text =
+			typeof value === "string"
+				? sanitizeDisplayText(value)
+				: (JSON.stringify(value, null, 2) ?? String(value));
+		return `  ${key}: ${text.replace(/\t/g, "   ").replace(/\r/g, "").split("\n").join("\n    ")}`;
+	});
+	return `${header}\n${theme.fg("muted", lines.join("\n"))}`;
+}
+
+function bashCall(args: unknown, theme: ThemeLike, context: RenderContextLike): Component {
+	startTimer(context);
+	const record = (args ?? {}) as Record<string, unknown>;
+	const rawCommand = typeof record.command === "string" ? record.command : "";
+	const timeout = record.timeout;
+	const timeoutText = typeof timeout === "number" ? ` (timeout ${timeout}s)` : "";
+
+	if (context.expanded) {
+		const body = sanitizeDisplayText(rawCommand) || "...";
+		const suffix = timeoutText ? theme.fg("muted", timeoutText) : "";
+		const timer = timerText(context, context.isPartial === true);
+		const tail = timer ? theme.fg("muted", `${SEPARATOR}${timer}`) : "";
+		return indentedText(`${theme.fg("toolTitle", theme.bold(`$ ${body}`))}${suffix}${tail}`);
+	}
+
+	const command = sanitizeDisplayText(rawCommand.replace(/\s+/g, " ").trim());
+	const body = command
+		? visibleWidth(command) > COMMAND_CHARS
+			? `${clipPlainText(command, COMMAND_CHARS)}…`
+			: command
+		: "...";
+	const parts: LinePart[] = [{ text: `$ ${body}`, color: "toolTitle", bold: true }];
+	if (timeoutText) {
+		parts.push({ text: timeoutText, color: "muted" });
+	}
+	return buildToolRow(theme, parts, readRowSummary(context), timerText(context, context.isPartial === true));
+}
+
+function writePath(args: unknown): string {
+	const record = (args ?? {}) as Record<string, unknown>;
+	return typeof record.file_path === "string"
+		? record.file_path
+		: typeof record.path === "string"
+			? record.path
+			: "";
+}
+
+function writeCall(args: unknown, theme: ThemeLike, context: RenderContextLike): Component {
+	const rawPath = writePath(args);
+	const record = (args ?? {}) as Record<string, unknown>;
+	const content = typeof record.content === "string" ? record.content : null;
+	const title: LinePart = { text: "write", color: "toolTitle", bold: true };
+
+	if (content === null) {
+		return indentedText(
+			`${theme.fg("toolTitle", theme.bold("write"))} ${rawPath ? shortenPath(sanitizeDisplayText(rawPath)) : "..."}\n${theme.fg("error", "[invalid content arg - expected string]")}`,
+		);
+	}
+
+	// 文件内容通常以换行结尾，countLines 会把末尾换行算成一行，这里先去掉尾部空行再数
+	const trimmedContent = content.replace(/\n+$/, "");
+	const total = trimmedContent ? countLines(trimmedContent) : 0;
+	const previewLines = context.expanded ? total : Math.min(LINES.write, total);
+
+	if (!context.expanded && previewLines === 0) {
+		return buildToolRow(
+			theme,
+			[title, pathPart(rawPath)],
+			makeSummary([total > 0 ? lineCountSummary(total) : undefined]),
+			undefined,
+		);
+	}
+
+	// 折叠预览只解析需要的头部：write 参数会流式增长，每次对整个文件高亮是 O(n²)
+	const source = previewLines < total ? headText(content, previewLines) : content;
+	const normalized = sanitizeDisplayText(source).replace(/\t/g, "   ").replace(/\n+$/, "");
+	const lang = getLanguageFromPath(rawPath);
+	let highlighted = false;
+	let lines: string[];
+	if (lang && normalized.length <= 200_000) {
+		lines = highlightCode(normalized, lang);
+		highlighted = true;
+	} else {
+		lines = normalized.split("\n");
+	}
+	const shown = previewLines < lines.length ? lines.slice(0, previewLines) : lines;
+	const styled = shown.map((line) => (highlighted ? line : theme.fg("toolOutput", line))).join("\n");
+	const hidden = total - shown.length;
+	const parts: LinePart[] = [title, pathPart(rawPath)];
+	if (hidden > 0) {
+		parts.push({ text: `${SEPARATOR}${lineCountSummary(total)}`, color: "muted" });
+	}
+	const row = buildToolRow(theme, parts, undefined, undefined);
+	const container = new Container();
+	container.addChild(row);
+	if (styled) {
+		container.addChild(indentedText(`\n${styled}`));
+	}
+	return container;
+}
+
+function editPath(args: unknown): string {
+	const record = (args ?? {}) as Record<string, unknown>;
+	return typeof record.file_path === "string"
+		? record.file_path
+		: typeof record.path === "string"
+			? record.path
+			: "";
+}
+
+function editCall(args: unknown, theme: ThemeLike, context: RenderContextLike): Component {
+	const rawPath = editPath(args);
+	const parts: LinePart[] = [{ text: "edit", color: "toolTitle", bold: true }, pathPart(rawPath)];
+	if (context.expanded) {
+		const timer = timerText(context, context.isPartial === true);
+		const tail = timer ? theme.fg("muted", `${SEPARATOR}${timer}`) : "";
+		const display = rawPath ? shortenPath(sanitizeDisplayText(rawPath)) : "...";
+		return indentedText(`${theme.fg("toolTitle", theme.bold("edit"))} ${theme.fg("accent", display)}${tail}`);
+	}
+	return buildToolRow(theme, parts, readRowSummary(context), timerText(context, context.isPartial === true));
+}
+
+function genericCall(name: ToolName, args: unknown, theme: ThemeLike, context: RenderContextLike): Component {
+	const timer = timerText(context, context.isPartial === true);
+	if (context.expanded) {
+		const tail = timer ? theme.fg("muted", `${SEPARATOR}${timer}`) : "";
+		return indentedText(`${expandedCallText(name, args, theme)}${tail}`);
+	}
+	return buildToolRow(theme, callHeaderParts(name, args), readRowSummary(context), timer);
+}
+
+function renderCallFor(name: ToolName, args: unknown, theme: ThemeLike, context: RenderContextLike): Component {
+	if (name === "bash") {
+		return bashCall(args, theme, context);
+	}
+	if (name === "write") {
+		return writeCall(args, theme, context);
+	}
+	if (name === "edit") {
+		return editCall(args, theme, context);
+	}
+	return genericCall(name, args, theme, context);
+}
+
+/** 展开态：调用行下面是空行加完整内容 */
+function addExpandedBody(container: Container, styled: string): void {
+	if (styled) {
+		container.addChild(indentedText(`\n${styled}`));
+	}
+}
+
+/** 折叠态：预览 N 行（配置大于 0 时），否则什么都不渲染，让调用行独占一行 */
+function addCollapsedPreview(
+	container: Container,
+	lines: string[],
+	maxLines: number,
+	keep: "start" | "end",
+	theme: ThemeLike,
+	hiddenLabel: (hidden: number) => string,
+): void {
+	if (maxLines <= 0 || lines.length === 0) {
+		return;
+	}
+	const shown = keep === "end" ? lines.slice(-maxLines) : lines.slice(0, maxLines);
+	if (shown.length > 0) {
+		container.addChild(indentedText(`\n${shown.map((line) => theme.fg("toolOutput", line)).join("\n")}`));
+	}
+	const hidden = lines.length - shown.length;
+	if (hidden > 0) {
+		container.addChild(indentedText(hiddenLabel(hidden)));
+	}
+}
+
+function bashResult(result: ToolResultLike, options: RenderOptionsLike, theme: ThemeLike, context: RenderContextLike): Component {
+	const container = resultContainer(context);
+	const details = (result.details ?? {}) as ShellDetails;
+	const view = readOutput(context, result);
+	let output = view.text;
+	const fullOutputPath = details.fullOutputPath;
+
+	// 内置渲染会剥离结果里附带的输出文件 footer，避免与警告重复
+	if (!options.isPartial && details.truncation?.truncated && fullOutputPath && output.endsWith("]")) {
+		const footerStart = output.lastIndexOf("\n\n[");
+		if (footerStart !== -1 && output.slice(footerStart).includes(fullOutputPath)) {
+			output = output.slice(0, footerStart).trimEnd();
+		}
+	}
+
+	const lines = output === view.text ? view.lines : output ? output.split("\n") : [];
+	const warnings = shellWarnings(details);
+
+	if (options.expanded) {
+		publishRowSummary(context, undefined);
+		addExpandedBody(container, lines.map((line) => theme.fg("toolOutput", line)).join("\n"));
+		if (warnings.length > 0) {
+			container.addChild(indentedText(`\n${theme.fg("warning", `[${warnings.join(". ")}]`)}`));
+		}
+		return container;
+	}
+
+	if (context.isError) {
+		publishErrorSummary(context, lines);
+		return container;
+	}
+
+	const warningText = compactWarnings(warnings);
+	const summary = makeSummary(
+		[lines.length > 0 ? lineCountSummary(lines.length) : undefined, warningText],
+		warningText !== undefined ? "warning" : "muted",
+	);
+	publishRowSummary(context, summary);
+	addCollapsedPreview(container, lines, LINES.bash, "end", theme, (hidden) => `... (${hidden} earlier lines, ${expandHint()})`);
+	return container;
+}
+
+function writeResult(result: ToolResultLike, theme: ThemeLike, context: RenderContextLike): Component {
+	const container = resultContainer(context);
+	if (!context.isError) {
+		return container;
+	}
+	const output = readOutput(context, result).rawText;
+	if (output) {
+		container.addChild(indentedText(`\n${theme.fg("error", output)}`));
+	}
+	return container;
+}
+
+function editResult(result: ToolResultLike, options: RenderOptionsLike, theme: ThemeLike, context: RenderContextLike): Component {
+	const container = resultContainer(context);
+
+	if (context.isError) {
+		const output = readOutput(context, result).rawText;
+		if (output) {
+			container.addChild(indentedText(`\n${theme.fg("error", output)}`));
+		}
+		return container;
+	}
+
+	const diff = (result.details as { diff?: unknown } | undefined)?.diff;
+	if (typeof diff !== "string" || diff.length === 0) {
+		publishRowSummary(context, undefined);
+		return container;
+	}
+
+	const lines = sanitizeDisplayText(diff).replace(/\n+$/, "").split("\n");
+	if (options.expanded) {
+		publishRowSummary(context, undefined);
+		addExpandedBody(container, renderDiff(lines.join("\n")));
+		return container;
+	}
+
+	const maxLines = Math.min(LINES.edit, lines.length);
+	publishRowSummary(context, makeSummary([`${lines.length} diff ${lines.length === 1 ? "line" : "lines"}`]));
+	if (maxLines > 0) {
+		// 折叠预览从第一行改动附近开始，避免前面全是上下文、看不到真正改了什么
+		let start = 0;
+		if (maxLines < lines.length) {
+			const firstChange = lines.findIndex((line) => line.startsWith("+") || line.startsWith("-"));
+			if (firstChange !== -1) {
+				const contextBefore = Math.min(1, maxLines - 1);
+				start = Math.max(0, Math.min(firstChange - contextBefore, lines.length - maxLines));
+			}
+		}
+		addExpandedBody(container, renderDiff(lines.slice(start, start + maxLines).join("\n")));
+		const hidden = lines.length - start - maxLines;
+		if (hidden > 0) {
+			container.addChild(indentedText(theme.fg("muted", `... (${hidden} more lines, ${expandHint()})`)));
+		}
+	}
+	return container;
+}
+
+function genericResult(name: ToolName, result: ToolResultLike, options: RenderOptionsLike, theme: ThemeLike, context: RenderContextLike): Component {
+	const container = resultContainer(context);
+	const view = readOutput(context, result);
+	const lines = view.lines;
+	const warnings = listWarnings(name, result.details);
+
+	if (options.expanded) {
+		publishRowSummary(context, undefined);
+		addExpandedBody(container, lines.map((line) => theme.fg("toolOutput", line)).join("\n"));
+		if (warnings.length > 0) {
+			container.addChild(indentedText(`\n${theme.fg("warning", `[${warnings.join(". ")}]`)}`));
+		}
+		return container;
+	}
+
+	if (context.isError) {
+		publishErrorSummary(context, lines);
+		return container;
+	}
+
+	const warningText = compactWarnings(warnings);
+	publishRowSummary(
+		context,
+		makeSummary(
+			[lines.length > 0 ? lineCountSummary(lines.length) : undefined, warningText],
+			warningText !== undefined ? "warning" : "muted",
+		),
+	);
+	addCollapsedPreview(container, lines, LINES[name], "start", theme, (hidden) => `... (${hidden} more lines, ${expandHint()})`);
+	return container;
+}
+
+function renderResultFor(
+	name: ToolName,
+	result: ToolResultLike,
+	options: RenderOptionsLike,
+	theme: ThemeLike,
+	context: RenderContextLike,
+): Component {
+	if (name === "bash") {
+		return bashResult(result, options, theme, context);
+	}
+	if (name === "write") {
+		return writeResult(result, theme, context);
+	}
+	if (name === "edit") {
+		return editResult(result, options, theme, context);
+	}
+	return genericResult(name, result, options, theme, context);
+}
+
 export default function (pi: ExtensionAPI) {
+	enableCompactRows();
+	enableToolGroups();
+
 	// session_shutdown 覆盖 quit、reload、new、resume、fork，统一清理可能残留的计时器
 	pi.on("session_shutdown", () => {
 		stopAllTimers();
@@ -515,236 +1240,22 @@ export default function (pi: ExtensionAPI) {
 		if (!(toolName in DEFAULTS)) {
 			return next();
 		}
-
 		const name = toolName as ToolName;
-
-		if (name === "bash") {
-			const renderers: ToolRenderers = {
-				renderCall(args, theme, context) {
-					startTimer(context);
-					const record = (args ?? {}) as Record<string, unknown>;
-					const rawCommand = typeof record.command === "string" ? record.command : "";
-					const timeout = record.timeout;
-					const timeoutText = typeof timeout === "number" ? ` (timeout ${timeout}s)` : "";
-
-					if (context.expanded) {
-						const body = sanitizeDisplayText(rawCommand) || "...";
-						const text = `${theme.fg("toolTitle", theme.bold(`$ ${body}`))}${theme.fg("muted", timeoutText)}`;
-						const component =
-							context.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
-						component.setText(text);
-						return component;
-					}
-
-					const command = sanitizeDisplayText(rawCommand.replace(/\s+/g, " ").trim());
-					const body = command
-						? visibleWidth(command) > COMMAND_CHARS
-							? `${clipPlainText(command, COMMAND_CHARS)}…`
-							: command
-						: "...";
-					const parts: LinePart[] = [{ text: `$ ${body}`, color: "toolTitle", bold: true }];
-					if (timeoutText) {
-						parts.push({ text: timeoutText, color: "muted" });
-					}
-					const component =
-						context.lastComponent instanceof SingleLineText
-							? context.lastComponent
-							: new SingleLineText(theme);
-					component.setParts(parts);
-					return component;
-				},
-				renderResult(result, options, theme, context) {
-					const component =
-						context.lastComponent instanceof Container ? context.lastComponent : new Container();
-					component.clear();
-
-					const details = (result.details ?? {}) as ShellDetails;
-					const view = readOutput(context, result);
-					let output = view.text;
-					const fullOutputPath = details.fullOutputPath;
-
-					// 内置渲染会剥离结果里附带的输出文件footer，避免与警告重复
-					if (!options.isPartial && details.truncation?.truncated && fullOutputPath && output.endsWith("]")) {
-						const footerStart = output.lastIndexOf("\n\n[");
-						if (footerStart !== -1 && output.slice(footerStart).includes(fullOutputPath)) {
-							output = output.slice(0, footerStart).trimEnd();
-						}
-					}
-
-					const lines = output === view.text ? view.lines : output ? output.split("\n") : [];
-					const compact = !options.expanded && LINES.bash === 0;
-
-					if (output && options.expanded) {
-						const styled = lines
-							.map((line) => theme.fg("toolOutput", line))
-							.join("\n");
-						component.addChild(new Text(`\n${styled}`, 0, 0));
-					} else if (output && !compact) {
-						const styled = lines
-							.map((line) => theme.fg("toolOutput", line))
-							.join("\n");
-						component.addChild(new Spacer(1));
-						component.addChild(
-							new VisualLinePreview({
-								text: styled,
-								maxVisualLines: LINES.bash,
-								keep: "end",
-								formatHint: (hidden) =>
-									`${theme.fg("muted", `... (${hidden} earlier lines,`)} ${expandHint()}${theme.fg("muted", ")")}`,
-							}),
-						);
-					}
-
-					const warnings = shellWarnings(details);
-					if (warnings.length > 0) {
-						component.addChild(new Text(`\n${theme.fg("warning", `[${warnings.join(". ")}]`)}`, 0, 0));
-					}
-
-					const timer = timerText(context, options.isPartial);
-					if (compact) {
-						const parts: string[] = [];
-						if (output) {
-							parts.push(
-								`${theme.fg("muted", `... (${lines.length} lines,`)} ${expandHint()}${theme.fg("muted", ")")}`,
-							);
-						}
-						if (timer) {
-							parts.push(theme.fg("muted", timer));
-						}
-						if (parts.length > 0) {
-							component.addChild(new Text(`\n${parts.join(" · ")}`, 0, 0));
-						}
-					} else if (timer) {
-						component.addChild(new Text(`\n${theme.fg("muted", timer)}`, 0, 0));
-					}
-					return component;
-				},
-			};
-			return renderers;
-		}
-
-		if (name === "write") {
-			const renderers: ToolRenderers = {
-				renderCall(args, theme, context) {
-					const record = (args ?? {}) as Record<string, unknown>;
-					const rawPath = typeof record.file_path === "string" ? record.file_path : typeof record.path === "string" ? record.path : "";
-					const content = typeof record.content === "string" ? record.content : null;
-					let text = `${theme.fg("toolTitle", theme.bold("write"))} ${pathDisplay(rawPath, theme)}`;
-
-					if (content === null) {
-						text += `\n\n${theme.fg("error", "[invalid content arg - expected string]")}`;
-					} else if (content) {
-						const total = countLines(content);
-						const maxLines = context.expanded ? total : Math.min(LINES.write, total);
-						let shown: string[] = [];
-						if (maxLines > 0) {
-							// 折叠时只解析预览需要的头部：write 参数会流式增长，每次都对整个文件高亮是 O(n²)
-							const source = maxLines < total ? headText(content, maxLines) : content;
-							const normalized = sanitizeDisplayText(source).replace(/\t/g, "   ");
-							const lang = getLanguageFromPath(rawPath);
-							let highlighted = false;
-							let lines: string[];
-							if (lang && normalized.length <= 200_000) {
-								lines = highlightCode(normalized, lang);
-								highlighted = true;
-							} else {
-								lines = normalized.split("\n");
-							}
-							shown = maxLines < lines.length ? lines.slice(0, maxLines) : lines;
-							if (shown.length > 0) {
-								text += `\n\n${shown
-									.map((line) => (highlighted ? line : theme.fg("toolOutput", line)))
-									.join("\n")}`;
-							}
-						}
-						const hidden = total - shown.length;
-						if (hidden > 0) {
-							text += `\n${theme.fg("muted", `... (${hidden} more lines, ${total} total,`)} ${expandHint()}${theme.fg("muted", ")")}`;
-						}
-					}
-					return setResultText(context, text);
-				},
-				renderResult(result, _options, theme, context) {
-					if (!context.isError) {
-						return setResultText(context, "");
-					}
-					const output = readOutput(context, result).rawText;
-					return setResultText(context, output ? `\n${theme.fg("error", output)}` : "");
-				},
-			};
-			return renderers;
-		}
-
-		if (name === "edit") {
-			// 内置 edit 用 renderShell: "self" 并在调用行里提前预览 diff；这里改走默认 shell，
-			// diff 放到结果区，折叠时只渲染头部和行数提示，展开时才渲染完整 diff。
-			const renderers: ToolRenderers = {
-				renderCall(args, theme, context) {
-					const record = (args ?? {}) as Record<string, unknown>;
-					const rawPath =
-						typeof record.file_path === "string"
-							? record.file_path
-							: typeof record.path === "string"
-								? record.path
-								: "";
-					return setResultText(
-						context,
-						`${theme.fg("toolTitle", theme.bold("edit"))} ${pathDisplay(rawPath, theme)}`,
-					);
-				},
-				renderResult(result, options, theme, context) {
-					const component =
-						context.lastComponent instanceof Container ? context.lastComponent : new Container();
-					component.clear();
-
-					if (context.isError) {
-						const output = readOutput(context, result).rawText;
-						if (output) {
-							component.addChild(new Text(`\n${theme.fg("error", output)}`, 0, 0));
-						}
-						return component;
-					}
-
-					const diff = (result.details as { diff?: unknown } | undefined)?.diff;
-					if (typeof diff !== "string" || diff.length === 0) {
-						return component;
-					}
-
-					const lines = sanitizeDisplayText(diff).split("\n");
-					const maxLines = options.expanded ? lines.length : Math.min(LINES.edit, lines.length);
-					let text = "";
-					if (maxLines > 0) {
-						// 折叠预览从第一行改动附近开始，避免前面全是上下文、看不到真正改了什么
-						let start = 0;
-						if (maxLines < lines.length) {
-							const firstChange = lines.findIndex((line) => line.startsWith("+") || line.startsWith("-"));
-							if (firstChange !== -1) {
-								const contextBefore = Math.min(1, maxLines - 1);
-								start = Math.max(0, Math.min(firstChange - contextBefore, lines.length - maxLines));
-							}
-						}
-						text = `\n${renderDiff(lines.slice(start, start + maxLines).join("\n"))}`;
-					}
-					const hidden = lines.length - maxLines;
-					if (hidden > 0) {
-						const label = maxLines === 0 ? `${hidden} lines` : `${hidden} more lines`;
-						text += `\n${theme.fg("muted", `... (${label},`)} ${expandHint()}${theme.fg("muted", ")")}`;
-					}
-					if (text) {
-						component.addChild(new Text(text, 0, 0));
-					}
-					return component;
-				},
-			};
-			return renderers;
-		}
-
-		const base = next();
 		const renderers: ToolRenderers = {
-			...base,
+			// 保留 pi 默认卡片外壳：背景色、横向内边距和点击展开都由它提供，
+			// 折叠时只把纵向内边距归零，展开时还原。
+			renderShell: "default",
+			renderCall(args, theme, context) {
+				return renderCallFor(name, args, theme, context as unknown as RenderContextLike);
+			},
 			renderResult(result, options, theme, context) {
-				const warnings = listWarnings(name, result.details);
-				return renderLineList(result, options, theme, context, LINES[name], "start", warnings);
+				return renderResultFor(
+					name,
+					result as unknown as ToolResultLike,
+					options,
+					theme,
+					context as unknown as RenderContextLike,
+				);
 			},
 		};
 		return renderers;
