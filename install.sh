@@ -102,6 +102,17 @@ for skill_dir in "$repo_dir"/skills/*; do
   fi
 done
 
+# Pi 专有配置：只服务 Pi，集中在 pi/ 下，供链接到 agent 目录。
+if [[ "$want_pi" == 1 ]]; then
+  sources+=("$repo_dir/pi/APPEND_SYSTEM.md")
+  targets+=("$pi_dir/APPEND_SYSTEM.md")
+  for extension_path in "$repo_dir"/pi/extensions/*.ts; do
+    [[ -f "$extension_path" ]] || continue
+    sources+=("$extension_path")
+    targets+=("$pi_dir/extensions/$(basename -- "$extension_path")")
+  done
+fi
+
 # 先检查全部目标，避免因为已知冲突而只安装一部分。
 for i in "${!sources[@]}"; do
   source_path="${sources[$i]}"
@@ -132,5 +143,5 @@ for i in "${!sources[@]}"; do
 done
 
 if [[ "$want_pi" == 1 ]]; then
-  printf 'Pi 提示：%s 中的 skills/ 会被自动发现；如需改用其他目录，可在 settings.json 的 skills 中追加路径。\n' "$pi_dir" >&2
+  printf 'Pi 提示：%s/skills/ 与 %s/extensions/ 都会被自动发现；%s/APPEND_SYSTEM.md 会在启动时追加到系统提示。\n' "$pi_dir" "$pi_dir" "$pi_dir" >&2
 fi

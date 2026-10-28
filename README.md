@@ -9,10 +9,12 @@
 - `skills/code-simplification/`：保持行为不变的代码简化 skill。
 - `skills/deevid-tracking-doc/`：Deevid 埋点文档 skill，包含模板与界面元数据。
 - `skills/implementation-handoff/`：实现交接 skill。
-- `install.sh`：为选定客户端建立全局规则及 `skills/` 下所有 skill 的软链接。
+- `pi/APPEND_SYSTEM.md`：Pi 专有的系统提示追加段，通过 `~/.pi/agent/APPEND_SYSTEM.md` 加载，用于补充过程播报等行为约束。
+- `pi/extensions/`：Pi 专有扩展，逐个链接到 `~/.pi/agent/extensions/`，当前包含 `exit-alias`、`skill-shortcuts` 和 `tool-preview-lines`。
+- `install.sh`：为选定客户端建立全局规则、`skills/` 下所有 skill 以及 Pi 专有配置的软链接。
 - `tests/test_install.py`：在隔离目录验证安装、重复运行和冲突保护。
 
-以上四个 skill 在三个客户端共用同一份正文与配套资源，全局规则中的 skill 路径按当前客户端发现的实际位置解析。其他个人 skill、系统 skill 和插件不由此仓库管理。
+以上四个 skill 在三个客户端共用同一份正文与配套资源，全局规则中的 skill 路径按当前客户端发现的实际位置解析。`pi/` 下的内容只服务 Pi，不链接到其他客户端；未列出的个人 skill、系统 skill 和客户端插件不由此仓库管理。
 
 ## 在其他电脑安装
 
@@ -30,6 +32,15 @@ bash install.sh
 | Codex | `${CODEX_HOME:-$HOME/.codex}/AGENTS.md` | `${CODEX_HOME:-$HOME/.codex}/skills/` |
 | Claude Code | `~/.claude/CLAUDE.md` | `~/.claude/skills/` |
 | Pi | `${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/AGENTS.md` | `${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/skills/` |
+
+`pi/` 目录只服务 Pi，安装脚本只在目标包含 Pi 时创建以下链接：
+
+| 仓库路径 | Pi 加载位置 | 作用 |
+| --- | --- | --- |
+| `pi/APPEND_SYSTEM.md` | `<pi-dir>/APPEND_SYSTEM.md` | 启动时追加到系统提示末尾，补充过程播报等行为约束 |
+| `pi/extensions/*.ts` | `<pi-dir>/extensions/` | 启动时逐个自动发现的 Pi 扩展 |
+
+Pi 的扩展加载器会跟随软链接，链接后保持原文件名即可被识别。`install.sh` 只处理 `pi/extensions/` 下的 `*.ts` 文件；新增扩展子目录或带 `package.json` 的包时需要手动补充脚本。
 
 只使用其中一个客户端时，可选择安装目标：
 
@@ -60,7 +71,7 @@ Pi 的规则入口是 agent 目录下的上下文文件 `AGENTS.md`，对所有�
 ```bash
 git status
 git diff
-git add AGENTS.md skills/ README.md install.sh tests/ .gitignore
+git add AGENTS.md pi/ skills/ README.md install.sh tests/ .gitignore
 git commit -m "chore: sync personal agent configuration"
 git push
 ```
@@ -77,7 +88,7 @@ git push
 python3 -B -m unittest discover -s tests
 ```
 
-Claude Code 支持软链接 skill 文件夹和共享规则文件，参见[官方 skill 文档](https://code.claude.com/docs/en/skills#choose-where-skills-load)与[官方规则文档](https://code.claude.com/docs/en/memory#share-one-file-with-other-coding-tools)。Pi 支持 agent 目录下的 `AGENTS.md` 上下文文件、`skills/` 自动发现以及 `settings.json` 的 `skills` 资源路径，参见[配置文档](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/configuration.md)与 [skills 文档](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/skills.md)。本机已验证链接与资源可读性；自动加载和手动调用仍需在新客户端会话中确认。
+Claude Code 支持软链接 skill 文件夹和共享规则文件，参见[官方 skill 文档](https://code.claude.com/docs/en/skills#choose-where-skills-load)与[官方规则文档](https://code.claude.com/docs/en/memory#share-one-file-with-other-coding-tools)。Pi 支持 agent 目录下的 `AGENTS.md` 上下文文件、`skills/` 与 `extensions/` 自动发现、`APPEND_SYSTEM.md` 系统提示追加，以及 `settings.json` 的资源路径配置，参见[配置文档](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/configuration.md)、[skills 文档](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/skills.md)与 [extensions 文档](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md)。本机已验证链接与资源可读性；自动加载和手动调用仍需在新客户端会话中确认。
 
 ## 本机首次迁移与恢复
 
@@ -86,6 +97,8 @@ Claude Code 支持软链接 skill 文件夹和共享规则文件，参见[官方
 接入 Claude Code 时，原 `~/.claude/CLAUDE.md` 链接已另行备份到 `~/.claude/backups/agent-config-*`，新入口直接链接到本仓库，不再经过 Codex 目录。
 
 2026-10-22 迁入 `code-review-and-quality` 和 `code-simplification` 时，两个客户端的原目录分别备份到 `~/.codex/backups/agent-config-20261022-214639/` 和 `~/.claude/backups/agent-config-20261022-214639/`。两边正文一致，共享源完整保留 Claude Code 版本中的来源注释与附带检查清单。
+
+2026-10-28 迁入 Pi 专有的 `APPEND_SYSTEM.md` 与三个扩展时，原文件从 `~/.pi/agent/` 移入仓库的 `pi/`，原位置替换为软链接，没有保留额外备份，仓库中的文件即唯一副本。
 
 恢复时，先核对并保存迁移后在仓库中产生的修改，再逐项确认全局路径确实为指向此仓库的软链接；删除链接本身后，从对应备份目录移回原文件或文件夹。不要递归删除软链接目标。
 

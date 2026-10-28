@@ -36,6 +36,9 @@ class InstallTests(unittest.TestCase):
     def skill_names(self):
         return sorted(p.name for p in (REPO / "skills").iterdir() if p.is_dir())
 
+    def extension_names(self):
+        return sorted(p.name for p in (REPO / "pi/extensions").glob("*.ts"))
+
     def test_default_installs_all_clients_and_can_repeat(self):
         result = self.run_install()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -47,6 +50,9 @@ class InstallTests(unittest.TestCase):
             self.assert_link(config / filename, REPO / "AGENTS.md")
             for name in self.skill_names():
                 self.assert_link(config / "skills" / name, REPO / "skills" / name)
+        self.assert_link(self.pi / "APPEND_SYSTEM.md", REPO / "pi/APPEND_SYSTEM.md")
+        for extension in self.extension_names():
+            self.assert_link(self.pi / "extensions" / extension, REPO / "pi/extensions" / extension)
         result = self.run_install()
         self.assertEqual(result.returncode, 0, result.stderr)
 
@@ -66,6 +72,17 @@ class InstallTests(unittest.TestCase):
                 for other_config in others:
                     self.assertFalse(other_config.exists())
                 shutil.rmtree(config)
+
+    def test_pi_preinstalled_regular_file_blocks_whole_install(self):
+        self.pi.mkdir(parents=True)
+        appendix = self.pi / "APPEND_SYSTEM.md"
+        appendix.write_text("keep existing content")
+        result = self.run_install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(str(appendix), result.stderr)
+        self.assertFalse(self.codex.exists())
+        self.assertFalse(self.claude.exists())
+        self.assertEqual(appendix.read_text(), "keep existing content")
 
     def test_custom_codex_skills_directory_keeps_claude_separate(self):
         skills = self.root / "agents skills"
