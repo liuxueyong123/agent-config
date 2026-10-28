@@ -11,6 +11,8 @@
 - `skills/implementation-handoff/`：实现交接 skill。
 - `pi/APPEND_SYSTEM.md`：Pi 专有的系统提示追加段，通过 `~/.pi/agent/APPEND_SYSTEM.md` 加载，用于补充过程播报等行为约束。
 - `pi/extensions/`：Pi 专有扩展，逐个链接到 `~/.pi/agent/extensions/`，当前包含 `exit-alias`、`skill-shortcuts` 和 `tool-preview-lines`。
+- `pi/README.md`：Pi 专有配置说明，列出扩展依赖的内部特性与升级后的验证方法。
+- `pi/verify-internals.mjs`：校验上述内部特性是否仍然成立的脚本，升级 pi 后运行。
 - `install.sh`：为选定客户端建立全局规则、`skills/` 下所有 skill 以及 Pi 专有配置的软链接。
 - `tests/test_install.py`：在隔离目录验证安装、重复运行和冲突保护。
 
@@ -89,6 +91,17 @@ python3 -B -m unittest discover -s tests
 ```
 
 Claude Code 支持软链接 skill 文件夹和共享规则文件，参见[官方 skill 文档](https://code.claude.com/docs/en/skills#choose-where-skills-load)与[官方规则文档](https://code.claude.com/docs/en/memory#share-one-file-with-other-coding-tools)。Pi 支持 agent 目录下的 `AGENTS.md` 上下文文件、`skills/` 与 `extensions/` 自动发现、`APPEND_SYSTEM.md` 系统提示追加，以及 `settings.json` 的资源路径配置，参见[配置文档](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/configuration.md)、[skills 文档](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/skills.md)与 [extensions 文档](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md)。本机已验证链接与资源可读性；自动加载和手动调用仍需在新客户端会话中确认。
+
+## 升级 Pi 后
+
+Pi 专有扩展用到若干未写入扩展 API 文档的内部特性，清单与影响见 [pi/README.md](pi/README.md)。升级后先重建链接，再跑校验脚本：
+
+```bash
+bash install.sh --target pi
+node pi/verify-internals.mjs
+```
+
+脚本会加载扩展，逐项确认渲染路径、原型 patch 和折叠输出。全部通过后执行 `/reload`，目视确认折叠仍是一行、相邻调用连续、`ctrl+o` 能展开。
 
 ## 本机首次迁移与恢复
 
