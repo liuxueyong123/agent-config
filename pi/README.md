@@ -7,7 +7,7 @@
 | 路径 | 作用 |
 | --- | --- |
 | `APPEND_SYSTEM.md` | 追加到 pi 系统提示末尾，补充过程播报、子 agent 委派等行为约束 |
-| `extensions/tool-preview-lines.ts` | 接管工具调用渲染：折叠成一行，连续调用合并为可展开的折叠组 |
+| `extensions/tool-preview-lines.ts` | 接管工具调用渲染：折叠成一行，连续调用合并为可展开的折叠组；`/tool-lines` 的 off 子命令可在运行时改回原生渲染 |
 | `extensions/skill-shortcuts.ts` | `/skill:name` 在消息任意位置展开，并提供补全 |
 | `extensions/exit-alias.ts` | 把 `/exit` 注册为 `/quit` 的别名 |
 | `verify-internals.mjs` | 校验扩展依赖的 pi 内部特性是否仍然成立 |
@@ -78,6 +78,11 @@ node pi/verify-internals.mjs
 - 确认工具参数与路径里的控制字符会被清除（终端转义注入防护）。
 - 确认折叠时调用行 1 行、结果区 0 行，摘要经过一次延迟重绘后出现。
 - 确认 `Text` 仍然补齐整宽；如果哪天不再补齐，`PlainText` 可以考虑去掉。
+- 确认补丁所有权记在全局登记表里，两个原型上装的都是本扩展的包装函数。
+- 确认 `/tool-lines off` 能把两个原型还原、渲染器让位给原生实现，且登记表清空。
+- 确认 `/tool-lines on` 能把补丁和渲染器都装回来，`/tool-lines status` 报告开关与归属。
+- 确认重新加载模块后 `original` 仍是原生方法，调用链不随 `/reload` 次数变长。
+- 确认别的扩展接管原型方法后，关闭只放弃所有权，不把对方的补丁写回自己的 `original`。
 
 脚本默认从 `npm root -g` 和 `which pi` 推断包位置，也可以显式指定：
 
@@ -92,7 +97,14 @@ PI_PACKAGE_DIR=/path/to/pi-coding-agent node pi/verify-internals.mjs
 
 `verify-internals.mjs` 的断言直接对应上表。新增依赖内部结构的实现时，同步补一条检查，避免升级后只能靠肉眼发现。
 
-`enableCompactRows()` 和 `enableToolGroups()` 是仅有的两处改写 pi 运行时对象的地方，其余逻辑都走公开扩展 API。修改时要保留三层保护：原型上的幂等标记、安装过程的 `try/catch`，分组 patch 还要限定成员类型。
+`installCompactRows()` 和 `installToolGroups()`（各自配一个 `uninstall*`）是仅有的两处改写 pi 运行时对象的地方，其余逻辑都走公开扩展 API。修改时要保留三层保护：安装过程的 `try/catch`、分组 patch 限定成员类型，以及所有权登记表（`PATCH_TABLE_KEY`）——它替代了早期写在原型上的布尔幂等标记。
+
+登记表挂在 `globalThis` 上而非模块作用域，因为 `/reload` 换掉的只是模块实例。每个条目同时存 `wrapper` 和 `original`：`wrapper` 用来判断原型上的方法是否还归本扩展，`original` 用来还原。两条不变量不要拆开看：
+
+- 安装时若发现上一个实例的 `wrapper` 还挂在原型上，先剥回它的 `original` 再重新包装，否则每 reload 一次调用链就多一层。
+- 卸载时只有原型上仍是自己的 `wrapper` 才写回 `original`。别的扩展在之后包了一层时，链上留着我们的包装函数无副作用，但把它覆盖成我们的 `original` 会直接抹掉对方。
+
+`setEnabled()` 是唯一同时操作两个补丁和计时器的地方，`/tool-lines off` 就是调它。扩展加载时也调 `setEnabled(enabled)`：配置里写明关掉后，`/reload` 前那个实例残留的包装函数会一并卸掉。关闭后已渲染的旧组件保持现状（折叠的仍然折叠），只有后续工具调用回到原生渲染；`/reload` 会按配置重新决定要不要装回来。
 
 分组是替换 `chatContainer.children` 的结构：每个工具组件都会变成 `ToolGroup`（单个工具也一样，保证折叠外观一致），中间插入任何普通组件都会断开。新增依赖这一结构的逻辑前，先确认它不需要直接看到单个工具组件。
 

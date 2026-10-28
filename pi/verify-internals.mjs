@@ -126,7 +126,37 @@ try {
 let resolver;
 const loadedExtension = await jiti.import(EXTENSION, { default: true });
 const extensionFactory = loadedExtension.default ?? loadedExtension;
-extensionFactory({ on() {}, registerToolRenderer: (fn) => (resolver = fn) });
+
+const commands = new Map();
+const commandApi = {
+  on() {},
+  registerCommand(name, definition) {
+    commands.set(name, definition);
+  },
+  registerToolRenderer(fn) {
+    resolver = fn;
+  },
+};
+extensionFactory(commandApi);
+
+// 命令处理器的输出不需要真实 UI，这里只记录调用
+const notifications = [];
+const commandContext = {
+  ui: {
+    notify(text, level) {
+      notifications.push({ text, level });
+    },
+  },
+};
+
+async function runCommand(name, args) {
+  const definition = commands.get(name);
+  assert(definition !== undefined, `没有注册 /${name}`);
+  await definition.handler(args ?? "", commandContext);
+}
+
+/** 补丁登记表由扩展写在 globalThis 上，这里按同一个 symbol 读回来 */
+const patchTable = () => globalThis[Symbol.for("pi.tool-lines.patches")];
 
 const tui = await import(pathToFileURL(tuiEntry).href);
 
@@ -166,12 +196,13 @@ await record("扩展使用默认卡片外壳", () => {
 });
 
 await record("ToolExecutionComponent 与宿主是同一个类", () => {
-  const prototype = pi.ToolExecutionComponent.prototype;
+  const entry = patchTable()?.compactRows;
+  assert(entry !== undefined, "登记表里没有折叠补丁，扩展可能加载了另一份包实例");
   assert(
-    prototype[Symbol.for("pi.compact-tool-rows")] === true,
-    "patch 没有安装到宿主原型上，扩展可能加载了另一份包实例",
+    pi.ToolExecutionComponent.prototype.updateDisplay === entry.wrapper,
+    "宿主原型上没有本扩展的包装函数，patch 可能没生效",
   );
-  return "prototype 标记已写入";
+  return "wrapper 已在宿主原型上";
 });
 
 await record("独立工具保留块前空行，组内成员压到 0", () => {
@@ -525,7 +556,72 @@ await record("点击组内成员空白行也能展开收起", () => {
   return "move 不切换，点击可展开与收起";
 });
 
+await record("补丁所有权记在全局登记表里", () => {
+  const table = patchTable();
+  assert(table?.toolGroups !== undefined, "登记表里没有分组补丁");
+  assert(tui.Container.prototype.addChild === table.toolGroups.wrapper, "addChild 上的方法不是本扩展的包装函数");
+  return "compactRows / toolGroups";
+});
+
+await record("/tool-lines off 还原原型并让位给原生渲染", async () => {
+  const table = patchTable();
+  const originalUpdateDisplay = table.compactRows.original;
+  const originalAddChild = table.toolGroups.original;
+  await runCommand("tool-lines", "off");
+  assert(pi.ToolExecutionComponent.prototype.updateDisplay === originalUpdateDisplay, "updateDisplay 没有还原");
+  assert(tui.Container.prototype.addChild === originalAddChild, "addChild 没有还原");
+  assert(patchTable().compactRows === undefined && patchTable().toolGroups === undefined, "关闭后仍留着所有权条目");
+  assert(resolver("bash", () => "native") === "native", "渲染器没有让位给原生实现");
+  return "两个原型已还原，渲染器让位";
+});
+
+await record("/tool-lines on 重新装上补丁", async () => {
+  await runCommand("tool-lines", "on");
+  const table = patchTable();
+  assert(pi.ToolExecutionComponent.prototype.updateDisplay === table.compactRows.wrapper, "updateDisplay 没有重新装上");
+  assert(tui.Container.prototype.addChild === table.toolGroups.wrapper, "addChild 没有重新装上");
+  assert(resolver("bash", () => "native") !== "native", "渲染器没有恢复");
+  return "补丁与渲染器都回来了";
+});
+
+await record("/tool-lines status 报告开关与补丁归属", async () => {
+  notifications.length = 0;
+  await runCommand("tool-lines", "status");
+  const text = notifications.at(-1)?.text ?? "";
+  assert(text.includes("紧凑显示开启"), `状态输出不对：${text}`);
+  assert(text.includes("本扩展"), `状态没有报告补丁归属：${text}`);
+  return text;
+});
+
+await record("/reload 后新实例接管，调用链不叠加", async () => {
+  const before = patchTable().compactRows;
+  const reloaded = await jiti.import(EXTENSION, { default: true });
+  const factory = reloaded.default ?? reloaded;
+  factory(commandApi);
+  const after = patchTable().compactRows;
+  assert(after.wrapper !== before.wrapper, "重载没有产生新的模块实例，jiti 缓存了模块");
+  assert(after.original === before.original, "重载后被当成 original 的仍是上一个实例的包装函数，调用链会逐次变长");
+  assert(
+    pi.ToolExecutionComponent.prototype.updateDisplay === after.wrapper,
+    "重载后原型上不是新实例的包装函数",
+  );
+  return "original 保持原生方法";
+});
+
+await record("其他扩展接管后关闭只放弃所有权", async () => {
+  const foreign = function updateDisplay() {};
+  pi.ToolExecutionComponent.prototype.updateDisplay = foreign;
+  await runCommand("tool-lines", "off");
+  assert(
+    pi.ToolExecutionComponent.prototype.updateDisplay === foreign,
+    "关闭时把其他扩展的补丁写回了自己的 original",
+  );
+  assert(patchTable().compactRows === undefined, "关闭后仍留着所有权条目");
+  return "保留外部补丁";
+});
+
 const failed = results.filter((item) => !item.ok).length;
+
 console.log(`\n${manifest.name}@${manifest.version}`);
 console.log(packageDir);
 console.log("");

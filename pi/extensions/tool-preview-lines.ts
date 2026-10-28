@@ -25,6 +25,10 @@
  * 配置值大于 0 时，折叠状态下会在调用行下面额外输出这么多行预览。
  * 修改配置后需要重启会话或执行 /reload。
  * read 未展开时本来就不显示内容（只显示调用行），因此不在这里覆盖。
+ *
+ * 运行时可临时关闭：`/tool-lines off` 卸下两个原型补丁，后续工具调用回到 pi 原生渲染，
+ * `/tool-lines on` 再装回来，两者都只影响当前进程。想在每次启动时就关闭，
+ * 在同一份配置里写 `"enabled": false`。
  */
 
 import { existsSync, readFileSync } from "node:fs";
@@ -75,10 +79,42 @@ const ERROR_SUMMARY_CHARS = 60;
  * - 卡片外壳是 Box(1, 1)，折叠时把纵向内边距设为 0，展开时还原成 1，交互逻辑保持 pi 原本的实现。
  * 对所有工具生效，包括未接管渲染的 read，折叠组展开后各成员的高度才一致。
  */
-const COMPACT_ROWS_PATCH = Symbol.for("pi.compact-tool-rows");
 
 /** 组内成员标记，决定块前空行是否保留 */
 const GROUP_MEMBER = Symbol.for("pi.tool-group-member");
+
+/**
+ * 补丁登记表：每个点位记下「装上的包装函数」和「装之前的方法」。
+ * 前者用于判断补丁是否还归本扩展，后者用于还原成 pi 的原生渲染。
+ *
+ * 表挂在 globalThis 上：/reload 换掉的是模块实例，全局槽位不变，新实例才能认出上一个
+ * 实例留下的补丁，而不是在原型上再叠一层。两条不变量：
+ * - 只有原型上仍是本扩展的包装函数时才还原，不覆盖其他扩展后加的补丁；
+ * - 重装或卸下时清理条目，调用链长度不随 reload 次数增长。
+ */
+const PATCH_TABLE_KEY = Symbol.for("pi.tool-lines.patches");
+
+interface PatchTable {
+	compactRows?: {
+		wrapper: PatchableExecution["updateDisplay"];
+		original: PatchableExecution["updateDisplay"];
+	};
+	toolGroups?: {
+		wrapper: PatchableContainer["addChild"];
+		original: PatchableContainer["addChild"];
+	};
+}
+
+function patchTable(): PatchTable {
+	const store = globalThis as unknown as Record<symbol, PatchTable | undefined>;
+	const existing = store[PATCH_TABLE_KEY];
+	if (existing !== undefined) {
+		return existing;
+	}
+	const created: PatchTable = {};
+	store[PATCH_TABLE_KEY] = created;
+	return created;
+}
 
 interface PatchableSpacer {
 	setLines?: (lines: number) => void;
@@ -89,7 +125,6 @@ interface PatchableExecution {
 	contentBox?: { paddingY?: number; invalidateCache?: () => void };
 	children?: PatchableSpacer[];
 	updateDisplay: () => void;
-	[COMPACT_ROWS_PATCH]?: boolean;
 	[GROUP_MEMBER]?: boolean;
 }
 
@@ -101,14 +136,20 @@ function markGrouped(component: ToolExecutionComponent): void {
 	execution.children?.[0]?.setLines?.(0);
 }
 
-function enableCompactRows(): void {
+function installCompactRows(): void {
 	try {
 		const prototype = ToolExecutionComponent.prototype as unknown as PatchableExecution;
-		if (prototype[COMPACT_ROWS_PATCH] === true) {
-			return;
-		}
+		const table = patchTable();
 
-		const originalUpdateDisplay = prototype.updateDisplay;
+		// /reload 后原型上还挂着上一个实例的包装函数：先剥回它记录的 original，
+		// 否则每 reload 一次调用链就多一层。被其他扩展接管过的方法不在此列，原样保留。
+		const previous = table.compactRows;
+		if (previous !== undefined && prototype.updateDisplay === previous.wrapper) {
+			prototype.updateDisplay = previous.original;
+		}
+		delete table.compactRows;
+
+		const original = prototype.updateDisplay;
 		prototype.updateDisplay = function (this: PatchableExecution): void {
 			const expanded = this.expanded === true;
 
@@ -130,13 +171,27 @@ function enableCompactRows(): void {
 				spacer.setLines(expanded || this[GROUP_MEMBER] !== true ? 1 : 0);
 			}
 
-			originalUpdateDisplay.call(this);
+			original.call(this);
 		};
 
-		prototype[COMPACT_ROWS_PATCH] = true;
+		table.compactRows = { wrapper: prototype.updateDisplay, original };
 	} catch {
 		// 升级 pi 后内部结构变化时跳过，扩展其余部分仍然生效
 	}
+}
+
+/** 还原成原生渲染。只撕掉仍归本扩展的方法，其他扩展的补丁原样留着。 */
+function uninstallCompactRows(): void {
+	const prototype = ToolExecutionComponent.prototype as unknown as PatchableExecution;
+	const table = patchTable();
+	const entry = table.compactRows;
+	if (entry === undefined) {
+		return;
+	}
+	if (prototype.updateDisplay === entry.wrapper) {
+		prototype.updateDisplay = entry.original;
+	}
+	delete table.compactRows;
 }
 
 /** 折叠组只依赖工具组件的这几个成员，不绑定具体类 */
@@ -309,22 +364,24 @@ function isInvisibleAssistant(component: unknown): boolean {
  * - 中间插入文本、状态行等普通组件会自然断开，下一批工具另开一组。
  * - 只含 toolCall 的 assistant 组件会被先清掉，它们本来就不渲染任何行。
  */
-const TOOL_GROUPS_PATCH = Symbol.for("pi.tool-groups");
-
 interface PatchableContainer {
 	children: unknown[];
 	addChild: (component: unknown) => void;
-	[TOOL_GROUPS_PATCH]?: boolean;
 }
 
-function enableToolGroups(): void {
+function installToolGroups(): void {
 	try {
 		const prototype = Container.prototype as unknown as PatchableContainer;
-		if (prototype[TOOL_GROUPS_PATCH] === true) {
-			return;
-		}
+		const table = patchTable();
 
-		const originalAddChild = prototype.addChild;
+		// 与折叠补丁同理：先剥掉上一个实例留下的包装函数，再以它底下那一层为 original。
+		const previous = table.toolGroups;
+		if (previous !== undefined && prototype.addChild === previous.wrapper) {
+			prototype.addChild = previous.original;
+		}
+		delete table.toolGroups;
+
+		const original = prototype.addChild;
 		prototype.addChild = function (this: PatchableContainer, component: unknown): void {
 			if (component instanceof ToolExecutionComponent) {
 				// 先清掉末尾不可见的 assistant 组件，连续工具才能归到同一组
@@ -349,13 +406,27 @@ function enableToolGroups(): void {
 				this.children.push(group);
 				return;
 			}
-			originalAddChild.call(this, component);
+			original.call(this, component);
 		};
 
-		prototype[TOOL_GROUPS_PATCH] = true;
+		table.toolGroups = { wrapper: prototype.addChild, original };
 	} catch {
 		// 升级 pi 后内部结构变化时跳过，工具退回逐个显示
 	}
+}
+
+/** 取消分组，后续工具回到 pi 原本的逐个 addChild。 */
+function uninstallToolGroups(): void {
+	const prototype = Container.prototype as unknown as PatchableContainer;
+	const table = patchTable();
+	const entry = table.toolGroups;
+	if (entry === undefined) {
+		return;
+	}
+	if (prototype.addChild === entry.wrapper) {
+		prototype.addChild = entry.original;
+	}
+	delete table.toolGroups;
 }
 
 type ToolName = keyof typeof DEFAULTS;
@@ -412,6 +483,7 @@ interface ThemeLike {
 interface PreviewConfig {
 	lines: Record<ToolName, number>;
 	commandChars: number;
+	enabled: boolean;
 }
 
 /** 挂在 context.state 上的折叠摘要 */
@@ -424,13 +496,14 @@ interface RowSummary {
 function loadConfig(): PreviewConfig {
 	const lines = { ...DEFAULTS } as Record<ToolName, number>;
 	let commandChars = DEFAULT_COMMAND_CHARS;
+	let enabled = true;
 	if (!existsSync(CONFIG_PATH)) {
-		return { lines, commandChars };
+		return { lines, commandChars, enabled };
 	}
 	try {
 		const parsed: unknown = JSON.parse(readFileSync(CONFIG_PATH, "utf8"));
 		if (typeof parsed !== "object" || parsed === null) {
-			return { lines, commandChars };
+			return { lines, commandChars, enabled };
 		}
 		const record = parsed as Record<string, unknown>;
 		for (const name of Object.keys(DEFAULTS) as ToolName[]) {
@@ -443,13 +516,24 @@ function loadConfig(): PreviewConfig {
 		if (typeof chars === "number" && Number.isInteger(chars) && chars > 0) {
 			commandChars = chars;
 		}
+		// 只认布尔值：写成字符串之类就保持默认开启，不替用户猜意图
+		if (typeof record.enabled === "boolean") {
+			enabled = record.enabled;
+		}
 	} catch {
 		// 配置写错时退回默认值，不阻塞扩展加载
 	}
-	return { lines, commandChars };
+	return { lines, commandChars, enabled };
 }
 
-const { lines: LINES, commandChars: COMMAND_CHARS } = loadConfig();
+const CONFIG = loadConfig();
+const { lines: LINES, commandChars: COMMAND_CHARS } = CONFIG;
+
+/**
+ * 当前进程是否启用。配置里的 enabled 只决定初值；/tool-lines on|off 只改内存，不写文件，
+ * 避免改写用户手写的配置。
+ */
+let enabled = CONFIG.enabled;
 
 /** 只数换行符，避免为行数拆出整个数组 */
 function countLines(text: string): number {
@@ -728,6 +812,53 @@ function stopAllTimers(): void {
 		state.interval = undefined;
 	}
 	activeTimers.clear();
+}
+
+/** 补丁在宿主原型上的现状 */
+type PatchState = "absent" | "ours" | "taken";
+
+/**
+ * 运行时开关：装上/卸下两个补丁，并决定注册的渲染器是否让位给 pi 原生实现。
+ * 关闭时先停计时器再拆补丁，避免拆完还有 interval 在请求重绘。
+ */
+function setEnabled(next: boolean): void {
+	enabled = next;
+	if (next) {
+		installCompactRows();
+		installToolGroups();
+		return;
+	}
+	stopAllTimers();
+	uninstallToolGroups();
+	uninstallCompactRows();
+}
+
+function compactRowsState(): PatchState {
+	const entry = patchTable().compactRows;
+	if (entry === undefined) {
+		return "absent";
+	}
+	const prototype = ToolExecutionComponent.prototype as unknown as PatchableExecution;
+	return prototype.updateDisplay === entry.wrapper ? "ours" : "taken";
+}
+
+function toolGroupsState(): PatchState {
+	const entry = patchTable().toolGroups;
+	if (entry === undefined) {
+		return "absent";
+	}
+	const prototype = Container.prototype as unknown as PatchableContainer;
+	return prototype.addChild === entry.wrapper ? "ours" : "taken";
+}
+
+function patchStateLabel(state: PatchState): string {
+	if (state === "ours") {
+		return "本扩展";
+	}
+	if (state === "taken") {
+		return "已被其他扩展接管";
+	}
+	return "未安装";
 }
 
 function timerText(context: RenderContextLike, isPartial: boolean): string | undefined {
@@ -1228,8 +1359,35 @@ function renderResultFor(
 }
 
 export default function (pi: ExtensionAPI) {
-	enableCompactRows();
-	enableToolGroups();
+	// 走 setEnabled 而不是直接安装：配置里写了 enabled: false 时也要卸一次——
+	// /reload 之前那个实例的包装函数还挂在原型上，只跳过安装是关不掉的。
+	setEnabled(enabled);
+
+	// 逃生口：改完渲染代码发现行为不对时，先卸下补丁看原生输出，不必重启 pi
+	pi.registerCommand("tool-lines", {
+		description: "紧凑工具显示：on / off / status",
+		handler: async (args, ctx) => {
+			const action = args.trim().toLowerCase();
+			if (action === "on" || action === "off") {
+				setEnabled(action === "on");
+				ctx.ui.notify(
+					action === "on"
+						? "紧凑显示已开启（仅当前进程）"
+						: "紧凑显示已关闭，后续工具调用走 pi 原生渲染；永久关闭请在配置文件里写 \"enabled\": false",
+					"info",
+				);
+				return;
+			}
+			if (action !== "" && action !== "status") {
+				ctx.ui.notify("用法：/tool-lines [on|off|status]", "error");
+				return;
+			}
+			ctx.ui.notify(
+				`紧凑显示${enabled ? "开启" : "关闭"}；配置${CONFIG.enabled ? "默认启用" : "已置 enabled: false"}；折叠补丁 ${patchStateLabel(compactRowsState())}；分组补丁 ${patchStateLabel(toolGroupsState())}`,
+				"info",
+			);
+		},
+	});
 
 	// session_shutdown 覆盖 quit、reload、new、resume、fork，统一清理可能残留的计时器
 	pi.on("session_shutdown", () => {
@@ -1237,7 +1395,8 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerToolRenderer((toolName, next) => {
-		if (!(toolName in DEFAULTS)) {
+		// 关掉后让位给后面的渲染器，工具卡片回到 pi 原生外观
+		if (!enabled || !(toolName in DEFAULTS)) {
 			return next();
 		}
 		const name = toolName as ToolName;
