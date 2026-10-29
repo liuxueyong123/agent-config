@@ -7,7 +7,7 @@
 | 路径 | 作用 |
 | --- | --- |
 | `APPEND_SYSTEM.md` | 追加到 pi 系统提示末尾，补充过程播报、子 agent 委派等行为约束 |
-| `extensions/tool-preview-lines.ts` | 接管工具调用渲染：折叠成一行，连续调用合并为可展开的折叠组；`/tool-lines` 的 off 子命令可在运行时改回原生渲染 |
+| `extensions/tool-preview-lines.ts` | 接管工具调用渲染：折叠成一行，连续调用合并为可展开的折叠组，`edit`／`write` 单独成行；`/tool-lines off` 可在运行时改回原生渲染 |
 | `extensions/skill-shortcuts.ts` | `/skill:name` 在消息任意位置展开，并提供补全 |
 | `extensions/exit-alias.ts` | 把 `/exit` 注册为 `/quit` 的别名 |
 | `verify-internals.mjs` | 校验扩展依赖的 pi 内部特性是否仍然成立 |
@@ -24,12 +24,13 @@
 | 扩展与宿主共享同一份包实例 | 让 patch 作用到真实组件 | loader 以 `moduleCache: false` 加载扩展，但对 ESM 依赖走原生 import，共享模块缓存 | patch 装到另一份原型上，静默无效 |
 | 实例字段 `contentBox`、`expanded` | 压低卡片内边距 | 构造与 `setExpanded` 时写入 | 内边距不生效，折叠块仍有上下留白 |
 | `contentBox` 是 `Box(1, 1)` | 折叠时把 `paddingY` 设为 0 | 默认外壳用 Box，提供背景和横向内边距 | 折叠块仍占三行 |
-| `children[0]` 是 `Spacer(1)` | 独立工具保留空行，组内成员压到 0 | 构造函数里固定添加，支持 `setLines()` | 组内出现空行，或独立工具紧贴上文 |
+| `children[0]` 是 `Spacer(1)` | 紧跟工具块的组件压到 0，其余保留一行 | 构造函数里固定添加，支持 `setLines()` | 块内出现空行，或独立工具紧贴上文 |
 | `updateDisplay()` 在展开切换时调用 | 同步 `paddingY` 与 Spacer 高度 | `setExpanded` 后调用 | 内边距和块间距不随展开状态变化 |
 | 组标题行布局 | 折叠与收起 | 组固定输出「空行 + 标题」两行，成员从第 2 行开始 | 点击区域与渲染行错位 |
 | 渲染行数与鼠标坐标同源 | 点击展开 | `handleMouse()` 按 children 的实际高度换算坐标 | 改渲染行却不改布局，点击位置错位，工具无法展开 |
 | 默认外壳的 MouseRegion | 点击展开 | 渲染器返回的组件会被 `createResultRegion` 包裹 | 保留默认外壳即保留点击展开，不需要额外 patch 坐标 |
 | `Container.prototype.addChild` | 折叠组的分组入口 | pi 把每个工具组件直接 `chatContainer.addChild(...)`；`Container` 来自 pi-tui | 无法分组，工具退回逐个显示 |
+| 实例字段 `toolName` | 判断工具是否进组 | 构造函数写入，声明为 `private` 但运行时可读 | 退回分组，`edit`／`write` 被藏进组摘要 |
 | `AssistantMessageComponent` 的类名与 `lastMessage` | 识别只含 toolCall、渲染为空的消息 | 未压缩模块保留类名；`lastMessage.content` 可直接读 | 空的 assistant 组件夹在两轮工具之间，分组被打断 |
 | 工具组件的 `isPartial`、`result.isError`、`ui.requestRender` | 组摘要的状态与重绘 | 都是实例字段，`updateResult` 时更新 | 摘要不显示 running/failed，或点击后不重绘 |
 | `dispatchMouseEvent` 调用 `handleMouse` | 组内成员点击转发 | `Container.handleMouse` 按 child 渲染高度分发 | 组展开后点击定位错位 |
@@ -52,7 +53,7 @@ flowchart TD
     D -->|是| E["/reload 目视确认"]
     D -->|否| F[按失败项对照特性表]
     F --> G[确认是降级可用还是需要改扩展]
-    E --> H[折叠 1 行 / 组摘要可点开 / ctrl+o 展开详情]
+    E --> H[折叠 1 行 / 组摘要可点开 / edit、write 单独成行 / ctrl+o 展开详情]
 ```
 
 命令：
@@ -69,9 +70,10 @@ node pi/verify-internals.mjs
 - 检查扩展依赖的导出是否还在。
 - 用与 pi 相同的 loader 配置加载扩展，确认注册成功、六个工具都使用默认卡片外壳。
 - 确认扩展拿到的 `ToolExecutionComponent` 就是宿主使用的那一个，且 patch 已写入原型。
-- 确认折叠工具把块前 Spacer 压到 0、`paddingY` 压到 0，展开时二者都恢复；布局对包括 `read` 在内的所有工具生效。
+- 确认紧跟工具块的组件把块前 Spacer 压到 0、`paddingY` 压到 0，展开时二者都恢复；布局对包括 `read` 在内的所有工具生效。
 - 用真实 `ToolExecutionComponent` 渲染一次折叠卡片，确认只有 1 行，且第一行的点击能触发展开。
 - 确认连续工具会合并成折叠组、单个工具也建组、插入文本后另开一组。
+- 确认 `edit`／`write` 不进组：紧跟前后工具各占一行，紧跟文本或作为首块时保留空行，点击可展开与收起。
 - 确认只含 toolCall 的 assistant 组件不会断开组，含文本的仍断开，内容为空的不会被误删。
 - 确认组前保留一行空行，点击标题行能展开、再点能收起，组摘要能反映 running 与 failed。
 - 确认展开态仍显示耗时，且工具结束后计时器被清理。
@@ -106,7 +108,11 @@ PI_PACKAGE_DIR=/path/to/pi-coding-agent node pi/verify-internals.mjs
 
 `setEnabled()` 是唯一同时操作两个补丁和计时器的地方，`/tool-lines off` 就是调它。扩展加载时也调 `setEnabled(enabled)`：配置里写明关掉后，`/reload` 前那个实例残留的包装函数会一并卸掉。关闭后已渲染的旧组件保持现状（折叠的仍然折叠），只有后续工具调用回到原生渲染；`/reload` 会按配置重新决定要不要装回来。
 
-分组是替换 `chatContainer.children` 的结构：每个工具组件都会变成 `ToolGroup`（单个工具也一样，保证折叠外观一致），中间插入任何普通组件都会断开。新增依赖这一结构的逻辑前，先确认它不需要直接看到单个工具组件。
+分组是替换 `chatContainer.children` 的结构：除 `edit`／`write` 外，每个工具组件都会变成 `ToolGroup`（单个工具也一样，保证折叠外观一致），中间插入任何普通组件都会断开。新增依赖这一结构的逻辑前，先确认它不需要直接看到单个工具组件。
+
+`edit`／`write` 以独立组件留在 transcript，不参与分组：后面的工具遇到它们另开一组，也不会吸收它们进组；紧跟工具块时不占块前空行，紧跟文本时保留空行。它们的展开状态由自己的点击控制，展开时那一行空行会临时恢复，卡片整体下移一行。
+
+`/reload` 换掉模块实例后，transcript 里的旧 `ToolGroup` 不再与新实例的组件合并，紧跟旧组的 `edit`／`write` 会保留块前空行。只影响当前会话的视觉一致性，会话重建后恢复。
 
 `ToolGroup` 固定输出两行头部（第 0 行空行、第 1 行标题），成员从第 2 行开始。点击第 0、1 行切换折叠，其余行按成员高度偏移转发。改变这个行布局时，必须同步 `handleMouse` 的偏移量。
 

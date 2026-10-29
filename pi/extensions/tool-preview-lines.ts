@@ -8,6 +8,8 @@
  * - 折叠时结果区不占行，调用行、结果摘要、耗时合并成一行，仍使用 pi 默认的卡片 shell。
  * - 运行时把折叠工具的卡片纵向内边距压到 0，并去掉块前空行，让相邻调用连成一片。
  * - 连续的工具调用会收进一个折叠组，默认只显示一行摘要，点开后是各个工具的卡片。
+ * - edit / write 不进组：改动文件的操作需要始终可见，它们各自单独占一行（保留 diff/行数摘要），
+ *   紧跟工具块时不占块前空行，点这一行展开详情，与组里成员走同一条原生点击路径。
  * - 只有展开（app.tools.expand）时才输出完整命令、输出或 diff。
  *
  * 配置（可选，未配置的项使用 DEFAULTS，当前均为 0，即折叠时不预览结果内容）。
@@ -80,8 +82,14 @@ const ERROR_SUMMARY_CHARS = 60;
  * 对所有工具生效，包括未接管渲染的 read，折叠组展开后各成员的高度才一致。
  */
 
-/** 组内成员标记，决定块前空行是否保留 */
-const GROUP_MEMBER = Symbol.for("pi.tool-group-member");
+/**
+ * 连续工具块的成员标记：折叠时把块前空行压到 0。成员可能是折叠组里的工具，
+ * 也可能是紧跟工具块、但不进组的 edit / write。
+ *
+ * 字符串沿用旧名 "pi.tool-group-member"：这个 symbol 会留在组件实例上，/reload 换掉模块
+ * 实例后仍要靠同一个 key 认出旧标记，改字符串会让已渲染的成员重新长出空行。
+ */
+const TOOL_BLOCK_MEMBER = Symbol.for("pi.tool-group-member");
 
 /**
  * 补丁登记表：每个点位记下「装上的包装函数」和「装之前的方法」。
@@ -121,18 +129,31 @@ interface PatchableSpacer {
 }
 
 interface PatchableExecution {
+	toolName?: string;
 	expanded?: boolean;
 	contentBox?: { paddingY?: number; invalidateCache?: () => void };
 	children?: PatchableSpacer[];
 	updateDisplay: () => void;
-	[GROUP_MEMBER]?: boolean;
+	[TOOL_BLOCK_MEMBER]?: boolean;
 }
 
-/** 标记组件已被收进折叠组，组内成员之间不留空行 */
-function markGrouped(component: ToolExecutionComponent): void {
+/**
+ * 不进折叠组的工具。折叠组把成员整个藏起来，edit / write 恰恰是必须一眼看到的改动，
+ * 所以它们留在 transcript 里逐个渲染，折叠状态由自己的点击控制。
+ */
+const UNGROUPED_TOOLS: ReadonlySet<string> = new Set(["edit", "write"]);
+
+/** 组件的 toolName 是 pi 的私有字段，运行时可读；读不到时按进组处理，退回原有分组行为 */
+function isUngroupedTool(component: ToolExecutionComponent): boolean {
+	const { toolName } = component as unknown as PatchableExecution;
+	return typeof toolName === "string" && UNGROUPED_TOOLS.has(toolName);
+}
+
+/** 标记组件属于连续工具块：紧跟在前一个工具块后面，块前空行压到 0 */
+function markToolBlockMember(component: ToolExecutionComponent): void {
 	const execution = component as unknown as PatchableExecution;
-	execution[GROUP_MEMBER] = true;
-	// children[0] 是 pi 加的 Spacer(1)，入组后立即压掉
+	execution[TOOL_BLOCK_MEMBER] = true;
+	// children[0] 是 pi 加的 Spacer(1)，成为块成员后立即压掉
 	execution.children?.[0]?.setLines?.(0);
 }
 
@@ -165,10 +186,11 @@ function installCompactRows(): void {
 
 			// children[0] 是 pi 固定加在块前的 Spacer(1)。
 			// 不能只在渲染结果里删掉那行空行：鼠标坐标按 children 高度换算，布局和坐标必须一起变。
-			// 组内成员之间不留空行；独立工具保留一行，和 thinking 折叠块的间距一致。
+			// 块成员之间不留空行；其余独立工具保留一行，和 thinking 折叠块的间距一致。
+			// 展开时恢复那一行，所以展开紧贴的卡片会整体下移一行，这是有意的。
 			const spacer = this.children?.[0];
 			if (spacer !== undefined && typeof spacer.setLines === "function") {
-				spacer.setLines(expanded || this[GROUP_MEMBER] !== true ? 1 : 0);
+				spacer.setLines(expanded || this[TOOL_BLOCK_MEMBER] !== true ? 1 : 0);
 			}
 
 			original.call(this);
@@ -389,19 +411,28 @@ function installToolGroups(): void {
 					this.children.pop();
 				}
 				const last = this.children[this.children.length - 1];
+				// 不进组的工具直接进 transcript：它不能进组，后面的工具也不能把它吸收进组
+				if (isUngroupedTool(component)) {
+					// 紧跟工具块时连成一片、只占用一行；紧跟文本或位于开头时保留块前空行
+					if (last instanceof ToolGroup || last instanceof ToolExecutionComponent) {
+						markToolBlockMember(component);
+					}
+					original.call(this, component);
+					return;
+				}
 				if (last instanceof ToolGroup) {
-					markGrouped(component);
+					markToolBlockMember(component);
 					last.add(component as unknown as GroupMember);
 					return;
 				}
 				// 单个工具也建组，折叠后的外观与多个工具一致
 				const group = new ToolGroup();
-				if (last instanceof ToolExecutionComponent) {
+				if (last instanceof ToolExecutionComponent && !isUngroupedTool(last)) {
 					this.children.pop();
-					markGrouped(last);
+					markToolBlockMember(last);
 					group.add(last as unknown as GroupMember);
 				}
-				markGrouped(component);
+				markToolBlockMember(component);
 				group.add(component as unknown as GroupMember);
 				this.children.push(group);
 				return;

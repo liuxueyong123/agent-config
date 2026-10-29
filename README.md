@@ -101,7 +101,7 @@ bash install.sh --target pi
 node pi/verify-internals.mjs
 ```
 
-脚本会加载扩展，逐项确认渲染路径、原型 patch 和折叠输出。全部通过后执行 `/reload`，目视确认折叠仍是一行、相邻调用连续、`ctrl+o` 能展开。
+脚本会加载扩展，逐项确认渲染路径、原型 patch 和折叠输出。全部通过后执行 `/reload`，目视确认折叠仍是一行、相邻调用连续、`edit`／`write` 单独成行可点开、`ctrl+o` 能展开。
 
 ## 本机首次迁移与恢复
 

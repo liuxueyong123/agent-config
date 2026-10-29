@@ -205,7 +205,7 @@ await record("ToolExecutionComponent 与宿主是同一个类", () => {
   return "wrapper 已在宿主原型上";
 });
 
-await record("独立工具保留块前空行，组内成员压到 0", () => {
+await record("块前空行：紧贴工具块压到 0，其余保留一行", () => {
   const solo = makeTool("bash", { command: "solo" }, "1\n");
   const soloRows = solo.render(80).map(stripAnsi);
   assert(soloRows.length === 2 && soloRows[0] === "", `独立工具应保留一行空行：${JSON.stringify(soloRows)}`);
@@ -256,6 +256,79 @@ await record("单个工具也建组", () => {
   const rows = chat.render(80).map(stripAnsi);
   assert(rows.length === 2 && rows[1].includes("1 tool call"), `单工具摘要不对：${JSON.stringify(rows)}`);
   return "1 tool call，与多工具外观一致";
+});
+
+await record("edit / write 不进折叠组，单独一行且可点开", () => {
+  const chat = new tui.Container();
+  chat.addChild(makeTool("bash", { command: "a" }, "1\n"));
+  chat.addChild(makeTool("edit", { file_path: "a.ts" }, "ok\n"));
+  chat.addChild(makeTool("write", { file_path: "b.ts", content: "x\n" }, "ok\n"));
+  chat.addChild(makeTool("bash", { command: "b" }, "2\n"));
+  const names = chat.children.map((child) => child.constructor.name);
+  assert(
+    names.join(",") === "ToolGroup,ToolExecutionComponent,ToolExecutionComponent,ToolGroup",
+    `edit / write 被收进了折叠组：${names.join(",")}`,
+  );
+  const editTool = chat.children[1];
+  // 这条失败意味着 isUngroupedTool 读不到 toolName 而静默退回分组，不是分组逻辑回归
+  assert(
+    editTool.toolName === "edit",
+    "组件上读不到 toolName，不进组的判断会静默失效（pi 可能改了私有字段名）",
+  );
+
+  const rows = chat.render(80).map(stripAnsi);
+  assert(
+    rows.length === 6,
+    `预期两组各 2 行、两个独立工具各 1 行，实际 ${rows.length} 行：${JSON.stringify(rows)}`,
+  );
+  assert(rows[2].includes("edit"), `edit 行不在预期位置：${JSON.stringify(rows)}`);
+  assert(rows[3].includes("write"), `write 行不在预期位置：${JSON.stringify(rows)}`);
+
+  const clickAt = (y, height) => ({
+    type: "click",
+    button: "left",
+    x: 2,
+    y,
+    width: 80,
+    height,
+    screenX: 2,
+    screenY: y,
+    shift: false,
+    ctrl: false,
+    alt: false,
+  });
+  // 展开后多出内边距行，坐标不再固定，按渲染结果定位调用行
+  const clickRow = (needle) => {
+    const rendered = chat.render(80).map(stripAnsi);
+    const row = rendered.findIndex((line) => line.includes(needle));
+    assert(row !== -1, `渲染结果里找不到 ${needle} 行：${JSON.stringify(rendered)}`);
+    chat.handleMouse(clickAt(row, rendered.length));
+  };
+
+  clickRow("edit");
+  assert(editTool.expanded === true, "点击 edit 行没有展开");
+  assert(editTool.render(80).length > 2, "edit 展开后仍是 1 行");
+  clickRow("edit");
+  assert(editTool.expanded === false, "再次点击没有收起 edit");
+
+  // 紧贴只对工具块生效：接到文本后面或作为首块时，块前空行必须还在
+  for (const [label, children] of [
+    ["文本之后", [new tui.Text("assistant", 0, 0), makeTool("edit", { file_path: "a.ts" }, "ok\n")]],
+    ["作为首块", [makeTool("write", { file_path: "b.ts", content: "x\n" }, "ok\n")]],
+  ]) {
+    const solo = new tui.Container();
+    for (const child of children) {
+      solo.addChild(child);
+    }
+    const soloRows = solo.render(80).map(stripAnsi);
+    // 工具自身占「块前空行 + 调用行」两行
+    const leadingBlank = soloRows.length - 2;
+    assert(
+      leadingBlank >= 0 && soloRows[leadingBlank] === "",
+      `${label}的 edit / write 块前空行被压掉了：${JSON.stringify(soloRows)}`,
+    );
+  }
+  return "各自成行，点击可展开与收起，紧跟文本时保留空行";
 });
 
 await record("插入文本后另开一组", () => {
