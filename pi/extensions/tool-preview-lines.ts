@@ -9,7 +9,8 @@
  * - 运行时把折叠工具的卡片纵向内边距压到 0，并去掉块前空行，让相邻调用连成一片。
  * - 连续的工具调用会收进一个折叠组，默认只显示一行摘要，点开后是各个工具的卡片。
  * - edit / write 不进组：改动文件的操作需要始终可见，它们各自单独占一行（保留 diff/行数摘要），
- *   紧跟工具块时不占块前空行，点这一行展开详情，与组里成员走同一条原生点击路径。
+ *   连续出现时连成一片、不占块前空行，点这一行展开详情，与组里成员走同一条原生点击路径；
+ *   但紧跟折叠组时保留块前空行，让组的摘要行和文件修改行不被读成同一块。
  * - 只有展开（app.tools.expand）时才输出完整命令、输出或 diff。
  *
  * 配置（可选，未配置的项使用 DEFAULTS，当前均为 0，即折叠时不预览结果内容）。
@@ -149,7 +150,7 @@ function isUngroupedTool(component: ToolExecutionComponent): boolean {
 	return typeof toolName === "string" && UNGROUPED_TOOLS.has(toolName);
 }
 
-/** 标记组件属于连续工具块：紧跟在前一个工具块后面，块前空行压到 0 */
+/** 标记组件属于连续工具块：紧跟在前一个工具块后面的 edit / write，块前空行压到 0 */
 function markToolBlockMember(component: ToolExecutionComponent): void {
 	const execution = component as unknown as PatchableExecution;
 	execution[TOOL_BLOCK_MEMBER] = true;
@@ -413,8 +414,9 @@ function installToolGroups(): void {
 				const last = this.children[this.children.length - 1];
 				// 不进组的工具直接进 transcript：它不能进组，后面的工具也不能把它吸收进组
 				if (isUngroupedTool(component)) {
-					// 紧跟工具块时连成一片、只占用一行；紧跟文本或位于开头时保留块前空行
-					if (last instanceof ToolGroup || last instanceof ToolExecutionComponent) {
+					// 连续的 edit / write 连成一片，只占一行；但紧跟折叠组时保留块前空行，
+					// 否则组的摘要行和「edit 路径」行贴在一起，会读成同一个折叠块的一部分。
+					if (last instanceof ToolExecutionComponent) {
 						markToolBlockMember(component);
 					}
 					original.call(this, component);
@@ -1120,6 +1122,11 @@ function writeCall(args: unknown, theme: ThemeLike, context: RenderContextLike):
 	const title: LinePart = { text: "write", color: "toolTitle", bold: true };
 
 	if (content === null) {
+		// 参数还在流式写入或调用本身非法：折叠时同样只占一行，展开时才显示原因
+		if (!context.expanded) {
+			const summary: RowSummary = { text: "invalid content arg - expected string", tone: "error" };
+			return buildToolRow(theme, [title, pathPart(rawPath)], summary, timerText(context, context.isPartial === true));
+		}
 		return indentedText(
 			`${theme.fg("toolTitle", theme.bold("write"))} ${rawPath ? shortenPath(sanitizeDisplayText(rawPath)) : "..."}\n${theme.fg("error", "[invalid content arg - expected string]")}`,
 		);
@@ -1130,13 +1137,14 @@ function writeCall(args: unknown, theme: ThemeLike, context: RenderContextLike):
 	const total = trimmedContent ? countLines(trimmedContent) : 0;
 	const previewLines = context.expanded ? total : Math.min(LINES.write, total);
 
-	if (!context.expanded && previewLines === 0) {
-		return buildToolRow(
-			theme,
-			[title, pathPart(rawPath)],
-			makeSummary([total > 0 ? lineCountSummary(total) : undefined]),
-			undefined,
-		);
+	if (!context.expanded && (previewLines === 0 || context.isError)) {
+		// 折叠态必须只有一行：没有可预览的行，或结果报错。报错时不因为配置了预览行数就输出多行内容
+		// 摘要由 renderResult 发布（错误或行数）；错误时把行数拼在后面，避免报错看不到写了多少
+		const published = readRowSummary(context);
+		const lineCount = total > 0 ? lineCountSummary(total) : undefined;
+		const summary =
+			published === undefined ? makeSummary([lineCount]) : makeSummary([published.text, lineCount], published.tone);
+		return buildToolRow(theme, [title, pathPart(rawPath)], summary, timerText(context, context.isPartial === true));
 	}
 
 	// 折叠预览只解析需要的头部：write 参数会流式增长，每次对整个文件高亮是 O(n²)
@@ -1158,7 +1166,7 @@ function writeCall(args: unknown, theme: ThemeLike, context: RenderContextLike):
 	if (hidden > 0) {
 		parts.push({ text: `${SEPARATOR}${lineCountSummary(total)}`, color: "muted" });
 	}
-	const row = buildToolRow(theme, parts, undefined, undefined);
+	const row = buildToolRow(theme, parts, undefined, timerText(context, context.isPartial === true));
 	const container = new Container();
 	container.addChild(row);
 	if (styled) {
@@ -1281,15 +1289,39 @@ function bashResult(result: ToolResultLike, options: RenderOptionsLike, theme: T
 	return container;
 }
 
-function writeResult(result: ToolResultLike, theme: ThemeLike, context: RenderContextLike): Component {
+/**
+ * edit / write 的错误结果：折叠时只把首行摘要并进调用行，卡片留空保持一行；
+ * 完整错误文本只在展开时输出。展开与否看 renderResult 的 options，与同文件其它结果分支一致。
+ */
+function renderErrorBody(
+	container: Container,
+	view: OutputView,
+	options: RenderOptionsLike,
+	theme: ThemeLike,
+	context: RenderContextLike,
+): void {
+	if (options.expanded) {
+		publishRowSummary(context, undefined);
+		// 用 trim 过的 text：原始错误常以换行结尾，留在正文里会多出一个空行
+		if (view.text) {
+			container.addChild(indentedText(`\n${theme.fg("error", view.text)}`));
+		}
+		return;
+	}
+	publishErrorSummary(context, view.lines);
+}
+
+function writeResult(
+	result: ToolResultLike,
+	options: RenderOptionsLike,
+	theme: ThemeLike,
+	context: RenderContextLike,
+): Component {
 	const container = resultContainer(context);
 	if (!context.isError) {
 		return container;
 	}
-	const output = readOutput(context, result).rawText;
-	if (output) {
-		container.addChild(indentedText(`\n${theme.fg("error", output)}`));
-	}
+	renderErrorBody(container, readOutput(context, result), options, theme, context);
 	return container;
 }
 
@@ -1297,10 +1329,7 @@ function editResult(result: ToolResultLike, options: RenderOptionsLike, theme: T
 	const container = resultContainer(context);
 
 	if (context.isError) {
-		const output = readOutput(context, result).rawText;
-		if (output) {
-			container.addChild(indentedText(`\n${theme.fg("error", output)}`));
-		}
+		renderErrorBody(container, readOutput(context, result), options, theme, context);
 		return container;
 	}
 
@@ -1381,7 +1410,7 @@ function renderResultFor(
 		return bashResult(result, options, theme, context);
 	}
 	if (name === "write") {
-		return writeResult(result, theme, context);
+		return writeResult(result, options, theme, context);
 	}
 	if (name === "edit") {
 		return editResult(result, options, theme, context);

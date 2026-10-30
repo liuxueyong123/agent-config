@@ -161,7 +161,7 @@ const patchTable = () => globalThis[Symbol.for("pi.tool-lines.patches")];
 
 const tui = await import(pathToFileURL(tuiEntry).href);
 
-function makeTool(name, args, text, { partial = false, error = false } = {}) {
+function makeTool(name, args, text, { partial = false, error = false, durationMs = undefined } = {}) {
   const base = name === "bash" ? pi.createBashToolDefinition(process.cwd()) : pi.createReadToolDefinition(process.cwd());
   const renderers = resolver(name, () => base);
   const component = new pi.ToolExecutionComponent(
@@ -176,7 +176,7 @@ function makeTool(name, args, text, { partial = false, error = false } = {}) {
   if (partial) {
     component.markExecutionStarted();
   }
-  component.updateResult({ content: [{ type: "text", text }], details: {}, isError: error }, partial);
+  component.updateResult({ content: [{ type: "text", text }], details: {}, isError: error, durationMs }, partial);
   return component;
 }
 
@@ -259,7 +259,7 @@ await record("单个工具也建组", () => {
   return "1 tool call，与多工具外观一致";
 });
 
-await record("edit / write 不进折叠组，单独一行且可点开", () => {
+await record("edit / write 不进折叠组，紧跟折叠组时保留空行", () => {
   const chat = new tui.Container();
   chat.addChild(makeTool("bash", { command: "a" }, "1\n"));
   chat.addChild(makeTool("edit", { file_path: "a.ts" }, "ok\n"));
@@ -279,11 +279,13 @@ await record("edit / write 不进折叠组，单独一行且可点开", () => {
 
   const rows = chat.render(80).map(stripAnsi);
   assert(
-    rows.length === 6,
-    `预期两组各 2 行、两个独立工具各 1 行，实际 ${rows.length} 行：${JSON.stringify(rows)}`,
+    rows.length === 7,
+    `预期「组 2 行 + 空行 + edit 1 行 + write 1 行 + 组 2 行」，实际 ${rows.length} 行：${JSON.stringify(rows)}`,
   );
-  assert(rows[2].includes("edit"), `edit 行不在预期位置：${JSON.stringify(rows)}`);
-  assert(rows[3].includes("write"), `write 行不在预期位置：${JSON.stringify(rows)}`);
+  // 组的摘要行与 edit 路径行之间必须留一行，否则会读成同一个折叠块的一部分
+  assert(rows[2] === "", `折叠组和 edit 之间应保留一行空行：${JSON.stringify(rows)}`);
+  assert(rows[3].includes("edit"), `edit 行不在预期位置：${JSON.stringify(rows)}`);
+  assert(rows[4].includes("write"), `write 行不在预期位置：${JSON.stringify(rows)}`);
 
   const clickAt = (y, height) => ({
     type: "click",
@@ -312,7 +314,7 @@ await record("edit / write 不进折叠组，单独一行且可点开", () => {
   clickRow("edit");
   assert(editTool.expanded === false, "再次点击没有收起 edit");
 
-  // 紧贴只对工具块生效：接到文本后面或作为首块时，块前空行必须还在
+  // 紧贴只对连续的 edit / write 生效：接到文本、折叠组后面或作为首块时，块前空行必须还在
   for (const [label, children] of [
     ["文本之后", [new tui.Text("assistant", 0, 0), makeTool("edit", { file_path: "a.ts" }, "ok\n")]],
     ["作为首块", [makeTool("write", { file_path: "b.ts", content: "x\n" }, "ok\n")]],
@@ -329,7 +331,7 @@ await record("edit / write 不进折叠组，单独一行且可点开", () => {
       `${label}的 edit / write 块前空行被压掉了：${JSON.stringify(soloRows)}`,
     );
   }
-  return "各自成行，点击可展开与收起，紧跟文本时保留空行";
+  return "组后留一行，edit / write 相邻贴紧，点击可展开与收起";
 });
 
 await record("插入文本后另开一组", () => {
@@ -505,35 +507,138 @@ const makeContext = () => ({
 await record("折叠时调用行 1 行、结果区 0 行", async () => {
   const problems = [];
   for (const name of TOOLS) {
-    const renderers = resolver(name, () => undefined);
-    const context = makeContext();
-    const args =
-      name === "bash"
-        ? { command: "echo hi" }
-        : name === "write"
-          ? { file_path: "a.ts", content: "x\n" }
-          : name === "edit"
-            ? { file_path: "a.ts" }
-            : { path: "." };
-    const call = renderers.renderCall(args, theme, context);
-    const callRows = call.render(120);
-    const details = name === "edit" ? { diff: "-a\n+b" } : {};
-    const result = renderers.renderResult(
-      { content: [{ type: "text", text: "line\n" }], details },
-      { expanded: false, isPartial: false },
-      theme,
-      context,
-    );
-    const resultRows = result.render(120);
-    if (callRows.length !== 1) {
-      problems.push(`${name} 调用行 ${callRows.length} 行`);
-    }
-    if (resultRows.length !== 0) {
-      problems.push(`${name} 结果区 ${resultRows.length} 行`);
+    for (const isError of [false, true]) {
+      const label = isError ? `${name} 错误` : name;
+      const renderers = resolver(name, () => undefined);
+      const context = makeContext();
+      context.isError = isError;
+      const args =
+        name === "bash"
+          ? { command: "echo hi" }
+          : name === "write"
+            ? { file_path: "a.ts", content: "x\n" }
+            : name === "edit"
+              ? { file_path: "a.ts" }
+              : { path: "." };
+      const call = renderers.renderCall(args, theme, context);
+      const callRows = call.render(120);
+      const details = name === "edit" ? { diff: "-a\n+b" } : {};
+      const result = renderers.renderResult(
+        { content: [{ type: "text", text: isError ? "boom\nsecond line\n" : "line\n" }], details },
+        { expanded: false, isPartial: false },
+        theme,
+        context,
+      );
+      const resultRows = result.render(120);
+      if (callRows.length !== 1) {
+        problems.push(`${label} 调用行 ${callRows.length} 行`);
+      }
+      if (resultRows.length !== 0) {
+        problems.push(`${label} 结果区 ${resultRows.length} 行`);
+      }
     }
   }
   assert(problems.length === 0, problems.join("；"));
-  return `${TOOLS.length} 个工具均为 1 行`;
+  return `${TOOLS.length} 个工具在成功与错误下都是 1 行`;
+});
+
+await record("错误结果折叠成一行，展开才输出完整错误", async () => {
+  const problems = [];
+  const errorText = "Could not find edits[2] in /a.ts.\nThe oldText must match exactly.\n";
+  for (const name of ["edit", "write"]) {
+    const renderers = resolver(name, () => undefined);
+    const context = makeContext();
+    context.isError = true;
+    const args = name === "edit" ? { file_path: "a.ts" } : { file_path: "a.ts", content: "x\n" };
+    const result = { content: [{ type: "text", text: errorText }], details: {} };
+
+    const collapsed = renderers.renderResult(result, { expanded: false, isPartial: false }, theme, context);
+    if (collapsed.render(120).length !== 0) {
+      problems.push(`${name} 折叠时仍渲染错误正文`);
+    }
+    // 摘要由 renderResult 发布，调用行要等下一次重绘才拿到
+    await new Promise((done) => setTimeout(done, 10));
+    const callRows = renderers.renderCall(args, theme, context).render(120);
+    if (callRows.length !== 1) {
+      problems.push(`${name} 调用行 ${callRows.length} 行`);
+    } else if (!callRows[0].includes("Could not find edits[2]")) {
+      problems.push(`${name} 调用行缺少错误摘要：${JSON.stringify(callRows)}`);
+    }
+
+    const expandedContext = { ...context, expanded: true };
+    const expandedRows = renderers
+      .renderResult(result, { expanded: true, isPartial: false }, theme, expandedContext)
+      .render(120);
+    const expanded = expandedRows.map(stripAnsi).join("\n");
+    if (!expanded.includes("The oldText must match exactly.")) {
+      problems.push(`${name} 展开后看不到完整错误：${JSON.stringify(expanded)}`);
+    }
+    // 错误原文常以换行结尾，正文必须先进 trim，否则尾部会多渲染一行空白
+    if (expandedRows.length > 1 && stripAnsi(expandedRows[expandedRows.length - 1]) === "") {
+      problems.push(`${name} 展开正末尾残留空行：${JSON.stringify(expandedRows.map(stripAnsi))}`);
+    }
+  }
+  assert(problems.length === 0, problems.join("；"));
+  return "edit / write 折叠 0 行，摘要进调用行，展开有完整错误";
+});
+
+await record("write 参数缺 content 时折叠仍是一行", () => {
+  const renderers = resolver("write", () => undefined);
+  const context = makeContext();
+  const rows = renderers.renderCall({ file_path: "a.ts" }, theme, context).render(120).map(stripAnsi);
+  assert(rows.length === 1, `折叠应只有 1 行，实际 ${rows.length} 行：${JSON.stringify(rows)}`);
+  assert(rows[0].includes("invalid content arg"), `折叠行缺少原因：${JSON.stringify(rows)}`);
+
+  context.expanded = true;
+  const expanded = renderers.renderCall({ file_path: "a.ts" }, theme, context).render(120);
+  assert(expanded.length === 2, `展开应显示原因，实际 ${expanded.length} 行`);
+  return "折叠 1 行，展开 2 行";
+});
+
+await record("真实组件：edit / write 错误折叠仍是一行", async () => {
+  const problems = [];
+  for (const name of ["edit", "write"]) {
+    // 走真实 ToolExecutionComponent，覆盖 renderCall/renderResult 的调用顺序与 context 字段
+    const args = name === "edit" ? { file_path: "a.ts" } : { file_path: "a.ts", content: "x\n" };
+    const tool = makeTool(name, args, "first line.\nsecond line.", { error: true, durationMs: 1200 });
+    // 摘要由 renderResult 发布，等一次延迟重绘把调用行重建出来
+    await new Promise((done) => setTimeout(done, 10));
+
+    const collapsed = tool.render(80);
+    const visible = collapsed.map(stripAnsi);
+    if (collapsed.length !== 2) {
+      problems.push(`${name} 折叠时 ${collapsed.length} 行：${JSON.stringify(visible)}`);
+    } else if (!visible[1].includes("first line.")) {
+      problems.push(`${name} 折叠行缺少错误摘要：${JSON.stringify(visible)}`);
+    } else if (name === "write") {
+      // write 的摘要槽位同时放错误、行数与耗时，三者都不能被挤掉
+      if (!visible[1].includes("1 line")) {
+        problems.push(`write 折叠行丢了行数摘要：${JSON.stringify(visible)}`);
+      }
+      if (!visible[1].includes("Took")) {
+        problems.push(`write 折叠行缺耗时：${JSON.stringify(visible)}`);
+      }
+    }
+
+    tool.setExpanded(true);
+    const expanded = tool.render(80).map(stripAnsi).join("\n");
+    if (!expanded.includes("second line.")) {
+      problems.push(`${name} 展开后看不到完整错误：${JSON.stringify(expanded)}`);
+    }
+    tool.setExpanded(false);
+    // 收起时摘要也要等一次延迟重绘才写回调用行，与其它工具同一套发布链路
+    await new Promise((done) => setTimeout(done, 10));
+    const recollapsed = tool.render(80).map(stripAnsi);
+    if (
+      recollapsed.length !== 2 ||
+      recollapsed[1] === undefined ||
+      !recollapsed[1].includes("first line.")
+    ) {
+      problems.push(`${name} 收起后没有回到一行带摘要：${JSON.stringify(recollapsed)}`);
+    }
+  }
+  assert(problems.length === 0, problems.join("；"));
+  return "折叠 2 行（空行 + 带摘要的卡片），展开有完整错误，收起后恢复一行";
 });
 
 await record("摘要经过一次延迟重绘后出现", async () => {
