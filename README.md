@@ -10,7 +10,7 @@
 - `skills/deevid-tracking-doc/`：Deevid 埋点文档 skill，包含模板与界面元数据。
 - `skills/implementation-handoff/`：实现交接 skill。
 - `pi/APPEND_SYSTEM.md`：Pi 专有的系统提示追加段，通过 `~/.pi/agent/APPEND_SYSTEM.md` 加载，用于补充过程播报等行为约束。
-- `pi/extensions/`：Pi 专有扩展，逐个链接到 `~/.pi/agent/extensions/`，当前包含 `exit-alias`、`skill-shortcuts` 和 `tool-preview-lines`。
+- `pi/extensions/`：Pi 专有扩展，逐个链接到 `~/.pi/agent/extensions/`，当前包含 `exit-alias`、`skill-shortcuts`、`task-timer` 和 `tool-preview-lines`。
 - `pi/README.md`：Pi 专有配置说明，列出扩展依赖的内部特性与升级后的验证方法。
 - `pi/verify-internals.mjs`：校验上述内部特性是否仍然成立的脚本，升级 pi 后运行。
 - `install.sh`：为选定客户端建立全局规则、`skills/` 下所有 skill 以及 Pi 专有配置的软链接。

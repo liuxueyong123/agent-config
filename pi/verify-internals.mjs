@@ -23,6 +23,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const EXTENSION = join(HERE, "extensions", "tool-preview-lines.ts");
+const TIMER_EXTENSION = join(HERE, "extensions", "task-timer.ts");
 const PACKAGE_NAMES = ["@earendil-works/pi-coding-agent", "@mariozechner/pi-coding-agent"];
 const TOOLS = ["bash", "grep", "ls", "find", "write", "edit"];
 const REQUIRED_EXPORTS = [
@@ -692,6 +693,222 @@ await record("其他扩展接管后关闭只放弃所有权", async () => {
   assert(patchTable().compactRows === undefined, "关闭后仍留着所有权条目");
   return "保留外部补丁";
 });
+
+/**
+ * task-timer 依赖 footer 的两件事：状态行永远是最后一行、FooterComponent.render 可 patch。
+ * 这里用最小的假 session 构造真实的 FooterComponent，不走 TUI 也能验证渲染结果。
+ */
+function makeFooterFixture() {
+  const statuses = new Map();
+  return {
+    statuses,
+    session: {
+      state: { model: { id: "probe", provider: "probe", reasoning: false, contextWindow: 1000 }, thinkingLevel: "off" },
+      sessionManager: {
+        getCwd: () => "/probe",
+        getSessionName: () => undefined,
+        getEntryCount: () => 0,
+        getSessionId: () => "probe-session",
+        getLeafId: () => "probe-leaf",
+        getEntries: () => [],
+      },
+      getContextUsage: () => undefined,
+      modelRuntime: { isUsingSubscription: () => false },
+      routedModel: undefined,
+    },
+    footerData: {
+      getGitBranch: () => null,
+      getAvailableProviderCount: () => 1,
+      getExtensionStatuses: () => statuses,
+    },
+  };
+}
+
+function renderFooter(fixture, width = 120) {
+  return new pi.FooterComponent(fixture.session, fixture.footerData).render(width).map(stripAnsi);
+}
+
+/** 收集 task-timer 注册的事件处理器，并提供一个只记录状态栏写入的假 ctx */
+function makeTimerHarness(fixture) {
+  const handlers = new Map();
+  const api = {
+    on(event, handler) {
+      if (!handlers.has(event)) handlers.set(event, []);
+      handlers.get(event).push(handler);
+      return () => {};
+    },
+  };
+  const ctx = {
+    hasUI: true,
+    ui: {
+      theme: { fg: (color, text) => `<${color}>${text}` },
+      setStatus(key, text) {
+        if (text === undefined) fixture.statuses.delete(key);
+        else fixture.statuses.set(key, text);
+      },
+    },
+  };
+  return {
+    api,
+    async emit(event, payload) {
+      for (const handler of handlers.get(event) ?? []) {
+        await handler({ type: event, ...payload }, ctx);
+      }
+    },
+  };
+}
+
+const timerPatchTable = () => globalThis[Symbol.for("pi.task-timer.footer-patch")];
+const timerModule = await jiti.import(TIMER_EXTENSION, { default: true });
+const timerFactory = timerModule.default ?? timerModule;
+assert(typeof timerFactory === "function", "task-timer 没有默认导出工厂函数");
+
+await record("FooterComponent 结构：扩展状态单独占最后一行", () => {
+  const fixture = makeFooterFixture();
+  fixture.statuses.set("probe", "<accent>probe status");
+  const lines = renderFooter(fixture);
+  assert(lines.length === 3, `footer 不是三行（pwd / 统计 / 状态）：${lines.length}`);
+  assert(lines[2] === "<accent>probe status", `最后一行不是状态行：${lines[2]}`);
+  return `${lines.length} 行，状态行在末尾`;
+});
+
+await record("task-timer 把状态行搬到 footer 第一行开头", async () => {
+  const fixture = makeFooterFixture();
+  const harness = makeTimerHarness(fixture);
+  timerFactory(harness.api);
+  await harness.emit("before_agent_start", { messageType: "user", prompt: "probe" });
+  const lines = renderFooter(fixture);
+  assert(lines.length === 2, `搬移后 footer 不是两行：${lines.length}`);
+  assert(lines[0].startsWith("<accent>⏱ Elapsed "), `第一行不是计时：${lines[0]}`);
+  assert(lines[0].endsWith("/probe"), `第一行丢了 pwd：${lines[0]}`);
+  await harness.emit("agent_settled", { aborted: false });
+  const settled = renderFooter(fixture);
+  assert(settled.length === 2, `结束后 footer 不是两行：${settled.length}`);
+  assert(settled[0].startsWith("<success>⏱ Took "), `结束后第一行不是总时长：${settled[0]}`);
+  return settled[0];
+});
+
+await record("别的扩展也写状态时保持原生三行布局", async () => {
+  const fixture = makeFooterFixture();
+  const harness = makeTimerHarness(fixture);
+  timerFactory(harness.api);
+  await harness.emit("before_agent_start", { messageType: "user", prompt: "probe" });
+  fixture.statuses.set("another-extension", "<dim>other</dim>");
+  const lines = renderFooter(fixture);
+  assert(lines.length === 3, `混排时不应搬走整行：${lines.length}`);
+  assert(lines[2].includes("⏱ Elapsed"), `混排时状态行不在末尾：${lines[2]}`);
+  await harness.emit("agent_settled", { aborted: false });
+  return "退回独立一行";
+});
+
+await record("task-timer 重载后 footer 补丁不叠加", async () => {
+  const before = timerPatchTable().relocate;
+  const reloadedModule = await jiti.import(TIMER_EXTENSION, { default: true });
+  const reloaded = reloadedModule.default ?? reloadedModule;
+  reloaded(makeTimerHarness(makeFooterFixture()).api);
+  const after = timerPatchTable().relocate;
+  assert(after.original === before.original, "重载后 original 仍是上一个实例的包装函数");
+  assert(pi.FooterComponent.prototype.render === after.wrapper, "重载后原型上不是新实例的包装函数");
+  return "original 保持原生 render";
+});
+
+/**
+ * 计时语义：用假时钟推进 Date.now，不必真的等上几分钟。
+ * 断言看渲染结果而不是内部状态，保证「起点 / 每秒刷新 / 定格」是用户能看到的行为。
+ */
+const sleepFor = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const realDateNow = Date.now;
+let timerClock = 1_000_000_000;
+Date.now = () => timerClock;
+
+async function startTimerTask(fixture, prompt = "probe") {
+  const harness = makeTimerHarness(fixture);
+  timerFactory(harness.api);
+  await harness.emit("input", { text: prompt, source: "interactive" });
+  return harness;
+}
+
+try {
+  await record("task-timer 起点包含启动前的自动压缩", async () => {
+    const fixture = makeFooterFixture();
+    const harness = await startTimerTask(fixture);
+    timerClock += 4000;
+    await harness.emit("before_agent_start", { messageType: "user", prompt: "probe" });
+    const first = renderFooter(fixture)[0];
+    assert(first.startsWith("<accent>⏱ Elapsed 4s"), `起点没有取 input 时间：${first}`);
+    await harness.emit("session_shutdown", {});
+    return first;
+  });
+
+  await record("task-timer 执行中每秒刷新，追加消息不重置起点", async () => {
+    const fixture = makeFooterFixture();
+    const harness = await startTimerTask(fixture);
+    await harness.emit("before_agent_start", { messageType: "user", prompt: "probe" });
+    timerClock += 26_000;
+    await sleepFor(1100);
+    const ticking = renderFooter(fixture)[0];
+    assert(ticking.startsWith("<accent>⏱ Elapsed 26s"), `计时没有刷新：${ticking}`);
+
+    await harness.emit("input", { text: "追加要求", source: "interactive", streamingBehavior: "steer" });
+    timerClock += 3000;
+    await harness.emit("before_agent_start", { messageType: "user", prompt: "追加要求" });
+    await sleepFor(1100);
+    const merged = renderFooter(fixture)[0];
+    assert(merged.startsWith("<accent>⏱ Elapsed 29s"), `追加消息重置了起点：${merged}`);
+    await harness.emit("session_shutdown", {});
+    return merged;
+  });
+
+  await record("task-timer 结束后定格且不再刷新", async () => {
+    const fixture = makeFooterFixture();
+    const harness = await startTimerTask(fixture);
+    await harness.emit("before_agent_start", { messageType: "user", prompt: "probe" });
+    timerClock += 63_000;
+    await harness.emit("agent_settled", { aborted: false });
+    const settled = renderFooter(fixture)[0];
+    assert(settled.startsWith("<success>⏱ Took 1m 03s"), `终值不对：${settled}`);
+
+    timerClock += 5000;
+    await sleepFor(1100);
+    const after = renderFooter(fixture);
+    assert(after.length === 2 && after[0] === settled, `结束后仍在刷新：${after[0]}`);
+    await harness.emit("session_shutdown", {});
+    return settled;
+  });
+
+  await record("task-timer 中断标注 aborted", async () => {
+    const fixture = makeFooterFixture();
+    const harness = await startTimerTask(fixture);
+    await harness.emit("before_agent_start", { messageType: "user", prompt: "probe" });
+    timerClock += 12_000;
+    await harness.emit("agent_settled", { aborted: true });
+    const line = renderFooter(fixture)[0];
+    assert(line.startsWith("<warning>⏱ Took 12s · aborted"), `中断标注不对：${line}`);
+    await harness.emit("session_shutdown", {});
+    return line;
+  });
+
+  await record("task-timer 忽略 custom 运行与斜杠命令的输入时间", async () => {
+    const fixture = makeFooterFixture();
+    const harness = await startTimerTask(fixture, "/model");
+    timerClock += 90_000;
+    await harness.emit("before_agent_start", { messageType: "user", prompt: "新任务" });
+    const line = renderFooter(fixture)[0];
+    assert(line.startsWith("<accent>⏱ Elapsed 0s"), `斜杠命令的时间污染了起点：${line}`);
+
+    const customFixture = makeFooterFixture();
+    const custom = makeTimerHarness(customFixture);
+    timerFactory(custom.api);
+    await custom.emit("before_agent_start", { messageType: "custom", message: { role: "user" } });
+    await custom.emit("agent_settled", { aborted: false });
+    assert(renderFooter(customFixture).length === 2, "custom 运行也写了状态栏");
+
+    await harness.emit("session_shutdown", {});
+    return "起点取运行开始时刻";
+  });
+} finally {
+  Date.now = realDateNow;
+}
 
 const failed = results.filter((item) => !item.ok).length;
 

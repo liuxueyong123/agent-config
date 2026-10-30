@@ -10,6 +10,7 @@
 | `extensions/tool-preview-lines.ts` | 接管工具调用渲染：折叠成一行，连续调用合并为可展开的折叠组，`edit`／`write` 单独成行；`/tool-lines off` 可在运行时改回原生渲染 |
 | `extensions/skill-shortcuts.ts` | `/skill:name` 在消息任意位置展开，并提供补全 |
 | `extensions/exit-alias.ts` | 把 `/exit` 注册为 `/quit` 的别名 |
+| `extensions/task-timer.ts` | 任务总时长：执行中每秒刷新 `⏱ Elapsed`，`agent_settled` 后定格为 `⏱ Took`，显示在 footer 第一行开头 |
 | `verify-internals.mjs` | 校验扩展依赖的 pi 内部特性是否仍然成立 |
 
 ## 内部特性依赖
@@ -41,6 +42,9 @@
 | `Text` 组件补齐整宽 | 说明为何展开内容不用内置 `Text` | 即使没有背景色也会把每行补到终端宽度 | 不影响正确性，仅行尾空格问题 |
 | 辅助函数导出 | 复用内置渲染能力 | `renderDiff`、`highlightCode`、`getLanguageFromPath`、`formatSize`、`DEFAULT_MAX_BYTES`、`keyHint` | 扩展加载即报错 |
 | `@earendil-works/pi-tui` 导出 | 自绘单行与多行组件 | `Container`、`visibleWidth`、`wrapTextWithAnsi`、`stripTerminalSequences` | 扩展加载即报错 |
+| `FooterComponent` 从包根导出 | footer 补丁入口 | 与 `ToolExecutionComponent` 同级导出，与 interactive-mode 用的是同一个类 | 补丁装不上，计时退回独立一行 |
+| `FooterComponent.prototype.render` 返回 `[pwd, 统计, …扩展状态]` | 把状态行搬到第一行开头 | 状态行固定最后一行，由 `getExtensionStatuses()` 拼接 | 结构不匹配时不搬移，计时留在末尾独立一行 |
+| `setStatus()` 每次调用都 `requestRender()` | 每秒刷新计时 | `setExtensionStatus()` 后无条件重绘，文本只做空白清理 | 计时停在上一秒，直到其他界面事件触发重绘 |
 
 ## 升级 pi 后验证
 
@@ -85,6 +89,13 @@ node pi/verify-internals.mjs
 - 确认 `/tool-lines on` 能把补丁和渲染器都装回来，`/tool-lines status` 报告开关与归属。
 - 确认重新加载模块后 `original` 仍是原生方法，调用链不随 `/reload` 次数变长。
 - 确认别的扩展接管原型方法后，关闭只放弃所有权，不把对方的补丁写回自己的 `original`。
+- 确认 `FooterComponent` 仍然输出 pwd、统计、扩展状态共三行，扩展状态在最后一行。
+- 确认 `task-timer` 把状态行搬到第一行开头后 footer 仍是两行，结束后终值同样在第一行。
+- 确认有别的扩展也写状态时保持原生三行布局，不把别人的内容一起搬走。
+- 确认 `task-timer` 重新加载后 footer 补丁不叠加，`original` 仍是原生 `render`。
+- 确认计时起点包含启动前的自动压缩，执行中每秒刷新，追加消息不重置起点。
+- 确认结束后定格为总时长并停表，中断时标注 `aborted`。
+- 确认 `custom` 运行与斜杠命令的输入时间不会污染下一个任务的起点。
 
 脚本默认从 `npm root -g` 和 `which pi` 推断包位置，也可以显式指定：
 
@@ -97,9 +108,11 @@ PI_PACKAGE_DIR=/path/to/pi-coding-agent node pi/verify-internals.mjs
 
 ## 改动这些文件时注意
 
+`task-timer` 的 footer 补丁只搬自己写的那一行：补丁拿 `globalThis[Symbol.for("pi.task-timer.status")]` 里最近一次写入的文本和 footer 最后一行比对，完全一致才搬到第一行开头并删掉末行，否则保持 pi 原生布局。这样别的扩展也写了状态、或终端太窄把文本截断时，不会把别人的内容一起搬走。补丁登记表沿用同一套 symbol 套路（`pi.task-timer.footer-patch`）：`/reload` 后新实例先剥回上一个实例的 `original` 再重新包装，调用链不随 reload 次数变长。
+
 `verify-internals.mjs` 的断言直接对应上表。新增依赖内部结构的实现时，同步补一条检查，避免升级后只能靠肉眼发现。
 
-`installCompactRows()` 和 `installToolGroups()`（各自配一个 `uninstall*`）是仅有的两处改写 pi 运行时对象的地方，其余逻辑都走公开扩展 API。修改时要保留三层保护：安装过程的 `try/catch`、分组 patch 限定成员类型，以及所有权登记表（`PATCH_TABLE_KEY`）——它替代了早期写在原型上的布尔幂等标记。
+`installCompactRows()` 和 `installToolGroups()`（各自配一个 `uninstall*`）与 `task-timer` 的 `installFooterRelocate()` 是改写 pi 运行时对象的几处地方，其余逻辑都走公开扩展 API。修改时要保留三层保护：安装过程的 `try/catch`、分组 patch 限定成员类型，以及所有权登记表——它替代了早期写在原型上的布尔幂等标记。
 
 登记表挂在 `globalThis` 上而非模块作用域，因为 `/reload` 换掉的只是模块实例。每个条目同时存 `wrapper` 和 `original`：`wrapper` 用来判断原型上的方法是否还归本扩展，`original` 用来还原。两条不变量不要拆开看：
 
