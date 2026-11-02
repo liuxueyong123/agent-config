@@ -11,7 +11,7 @@
 | `extensions/skill-shortcuts.ts` | `/skill:name` 在消息任意位置展开，并提供补全 |
 | `extensions/exit-alias.ts` | 把 `/exit` 注册为 `/quit` 的别名 |
 | `extensions/task-timer.ts` | 任务总时长：执行中每秒刷新 `⏱ Elapsed`，`agent_settled` 后定格为 `⏱ Took`，显示在 footer 第一行开头 |
-| `extensions/service-watch.ts` | 后台服务面板：轮询 TCP 监听端口，把本次 pi 运行中新起的服务（端口、命令行、运行时长、pid）显示在编辑器上方，`/services` 看完整命令行；只读，依赖 macOS 自带 `lsof` |
+| `extensions/service-watch.ts` | 后台服务面板：轮询 TCP 监听端口，只显示本 pi 进程启动的服务（靠环境标记判定归属，列出端口、命令行、运行时长、pid），`/services` 看完整命令行；只读，依赖 macOS 自带 `lsof` 与 `ps eww` |
 | `verify-internals.mjs` | 校验扩展依赖的 pi 内部特性是否仍然成立 |
 
 ## 内部特性依赖
@@ -47,6 +47,25 @@
 | `FooterComponent.prototype.render` 返回 `[pwd, 统计, …扩展状态]` | 把状态行搬到第一行开头 | 状态行固定最后一行，由 `getExtensionStatuses()` 拼接 | 结构不匹配时不搬移，计时留在末尾独立一行 |
 | `setStatus()` 每次调用都 `requestRender()` | 每秒刷新计时 | `setExtensionStatus()` 后无条件重绘，文本只做空白清理 | 计时停在上一秒，直到其他界面事件触发重绘 |
 
+### service-watch 的隐含前提
+
+`service-watch.ts` 靠环境变量继承判定「服务是不是当前 agent 起的」，同样依赖几处没有写进文档的行为。
+
+| 特性 | 用途 | 1.4.0 下的现状 | 失效后的表现 |
+| --- | --- | --- | --- |
+| 扩展与宿主共享 `process.env` | 加载时写入归属标记 `PI_SERVICE_WATCH_MARKER` | 扩展在主进程内运行，改的就是同一份 env | 标记写不进去，面板恒为空 |
+| bash 工具子进程继承宿主 `process.env` | 把标记传给 agent 启动的服务 | 用 RPC 的 `bash` 命令实测，子进程能读到扩展写入的变量 | 所有服务都不被统计，面板恒为空 |
+| `ps eww` 能回读本用户进程环境 | 判定监听进程归属 | `ps eww -p <pid> -o pid=,command=` 输出末尾附带完整环境 | 归属判定全为否，面板恒为空 |
+
+升级 pi 后确认第一条与第二条仍然成立：
+
+```bash
+printf '%s\n' '{"id":"m1","type":"bash","command":"env | grep -q ^PI_SERVICE_WATCH_MARKER= && echo MARKER_OK || echo MARKER_MISSING"}' \
+  | pi --mode rpc --no-session | grep -o 'MARKER_OK\|MARKER_MISSING'
+```
+
+输出 `MARKER_OK` 说明标记仍能传达到工具子进程；输出 `MARKER_MISSING` 或没有输出，就说明前提已经变了，面板会恒为空。
+
 ## 升级 pi 后验证
 
 ```mermaid
@@ -58,7 +77,7 @@ flowchart TD
     D -->|是| E["/reload 目视确认"]
     D -->|否| F[按失败项对照特性表]
     F --> G[确认是降级可用还是需要改扩展]
-    E --> H[折叠 1 行 / 组摘要可点开 / edit、write 单独成行 / ctrl+o 展开详情]
+    E --> H[折叠 1 行 / 组摘要可点开 / edit、write 单独成行 / ctrl+o 展开详情 / /services 只列当前 agent 起的服务]
 ```
 
 命令：
