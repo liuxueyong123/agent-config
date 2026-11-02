@@ -11,6 +11,7 @@
 | `extensions/skill-shortcuts.ts` | `/skill:name` 在消息任意位置展开，并提供补全 |
 | `extensions/exit-alias.ts` | 把 `/exit` 注册为 `/quit` 的别名 |
 | `extensions/task-timer.ts` | 任务总时长：执行中每秒刷新 `⏱ Elapsed`，`agent_settled` 后定格为 `⏱ Took`，显示在 footer 第一行开头 |
+| `extensions/service-watch.ts` | 后台服务面板：轮询 TCP 监听端口，把本次 pi 运行中新起的服务（端口、命令行、运行时长、pid）显示在编辑器上方，`/services` 看完整命令行；只读，依赖 macOS 自带 `lsof` |
 | `verify-internals.mjs` | 校验扩展依赖的 pi 内部特性是否仍然成立 |
 
 ## 内部特性依赖
